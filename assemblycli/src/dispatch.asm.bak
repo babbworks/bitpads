@@ -1,0 +1,126 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; dispatch.asm — Transmission Type Dispatcher
+;
+; Takes the fully populated bp_ctx and calls the appropriate builder function
+; based on BP_CTX_TYPE.  This is the central routing point between the CLI
+; argument parser and the frame-assembly layer.
+;
+; DISPATCH TABLE:
+;   BP_TYPE_SIGNAL (0) → build_signal
+;   BP_TYPE_WAVE   (1) → build_wave
+;   BP_TYPE_RECORD (2) → build_record
+;   BP_TYPE_LEDGER (3) → build_ledger
+;   BP_TYPE_TELEM  (4) → build_wave  (telemetry uses Wave framing, Engineering domain)
+;   anything else  → error: unknown type
+;
+; Exports: dispatch_build
+; Input:   rdi = pointer to bp_ctx (from cli_parse)
+; Output:  rax = 0 on success, -1 on error
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    extern build_signal
+    extern build_wave
+    extern build_record
+    extern build_ledger
+    extern fileio_write_stderr
+
+    global dispatch_build
+
+section .data
+
+err_unknown_type    db "bitpads: error: unknown transmission type (use --type signal|wave|record|ledger)", 10
+err_unknown_len     equ $ - err_unknown_type
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; dispatch_build
+;   Route bp_ctx to the correct builder based on BP_CTX_TYPE.
+;
+; Input:  rdi = pointer to bp_ctx
+; Output: rax = 0 on success, -1 on error
+; ─────────────────────────────────────────────────────────────────────────────
+dispatch_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    sub     rsp, 8                  ; align stack
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer (preserved through calls)
+
+    ; Read the transmission type code from bp_ctx
+    movzx   eax, byte [rbx + BP_CTX_TYPE]  ; eax = BP_TYPE_* code (0-4)
+                                            ; "what kind of BitPads frame this context builds"
+
+    ; ── Dispatch ──────────────────────────────────────────────────────────
+    cmp     al, BP_TYPE_SIGNAL      ; 0 = Pure Signal (1 byte)
+    je      .do_signal
+
+    cmp     al, BP_TYPE_WAVE        ; 1 = Wave (2-6 bytes)
+    je      .do_wave
+
+    cmp     al, BP_TYPE_RECORD      ; 2 = Full Record (12-21 bytes)
+    je      .do_record
+
+    cmp     al, BP_TYPE_LEDGER      ; 3 = BitLedger record (28+ bytes)
+    je      .do_ledger
+
+    cmp     al, BP_TYPE_TELEM       ; 4 = Telemetry (Wave framing, Engineering domain)
+    je      .do_telem
+
+    ; Unknown type — print error and return -1
+    lea     rsi, [rel err_unknown_type]
+    mov     rdx, err_unknown_len
+    call    fileio_write_stderr
+    mov     eax, -1
+    jmp     .done
+
+.do_signal:
+    ; Build a 1-byte Pure Signal frame.
+    ; "Standalone signal frame — no record body." (BP_TYPE_SIGNAL)
+    mov     rdi, rbx
+    call    build_signal            ; rax = 0 on success
+    jmp     .done
+
+.do_wave:
+    ; Build a lightweight Wave frame (Meta1 + Meta2 + optional blocks).
+    ; "Wave frame — lightweight data push." (BP_TYPE_WAVE)
+    mov     rdi, rbx
+    call    build_wave              ; rax = 0 on success
+    jmp     .done
+
+.do_record:
+    ; Build a full structured Record frame (Layer1 + optional Layer2 + body).
+    ; "Full Record frame — structured with optional blocks." (BP_TYPE_RECORD)
+    mov     rdi, rbx
+    call    build_record            ; rax = 0 on success
+    jmp     .done
+
+.do_ledger:
+    ; Build a BitLedger accounting frame (Layer1 + Layer2 + Layer3 + body).
+    ; "Ledger frame — BitLedger double-entry record." (BP_TYPE_LEDGER)
+    mov     rdi, rbx
+    call    build_ledger            ; rax = 0 on success, -1 on protocol error
+    jmp     .done
+
+.do_telem:
+    ; Telemetry uses Wave framing but defaults to Engineering domain.
+    ; If the domain was not explicitly set to engineering, set it now.
+    ; "Telemetry frame — engineering/sensor data." (BP_TYPE_TELEM)
+    cmp     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_FIN  ; still default financial?
+    jne     .telem_domain_ok
+    mov     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_ENG  ; switch to engineering domain
+.telem_domain_ok:
+    ; Reuse Wave builder — the category code and Engineering domain are already set
+    mov     rdi, rbx
+    call    build_wave              ; rax = 0 on success
+
+.done:
+    add     rsp, 8
+    pop     rbx
+    pop     rbp
+    ret

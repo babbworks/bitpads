@@ -1,0 +1,159 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; layer3.asm — Layer 3 BitLedger Record Builder
+;
+; Reference: BitPads Protocol v2 §3 (Layer 3 section)
+;            BitLedger Compound Mode Design Note §1–2
+;
+; Layer 3 is the 40-bit (5-byte) BitLedger accounting record. It encodes the
+; double-entry financial or physical flow relationship between two accounts.
+;
+; The 40-bit record structure:
+;   bytes[0..3]: Upper control fields (record type, control flags)
+;                Set to 0x00 in standard data records
+;   byte[4] bits7-4: Account Pair code (4 bits)
+;     The 16 possible account pair codes (0000-1111):
+;       0000 = Source → Sink
+;       0001 = Debtor → Creditor
+;       0010 = Asset / Liability
+;       0011 = Income / Expense
+;       0100 = Operating Income / Asset
+;       ... (14 standard pairs defined in BitLedger v3)
+;       1110 = Correction / Void
+;       1111 = Compound Continuation (REQUIRES compound mode active)
+;
+;   byte[4] bits3-2: Direction / Sub-type (2 bits)
+;     Standard records: direction of flow
+;     Compound (1111) records: sub-type (00=Standard, 01=Correcting,
+;                              10=Reversal, 11=Cross-batch)
+;
+;   byte[4] bit1: Completeness
+;     0 = Full / Standalone — this record stands alone, post immediately
+;     1 = Partial — compound watch: hold this record, more follows (1111 next)
+;
+;   byte[4] bit0: Extension flag
+;     0 = No extension byte follows
+;     1 = Extension byte follows carrying sub-category, party type, timestamp
+;
+; THE 1111 COMPOUND RULE (Compound Mode Design Note §1.1, §3):
+;   Account pair 1111 is the Compound Continuation marker.
+;   When compound mode = OFF: 1111 is ALWAYS a protocol error. It must not
+;   appear. Its presence signals transmission corruption. This is the "free
+;   error detection" benefit — in non-compound sessions, 1111 is an
+;   unambiguous sentinel for corruption.
+;   When compound mode = ON: 1111 is a valid continuation marker linking
+;   this record to the preceding record as part of one logical transaction.
+;
+; Exports: layer3_build
+; Requires: fileio_write_stderr (extern, for error output)
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    extern fileio_write_stderr
+
+    global layer3_build
+
+section .data
+
+    ; Error message emitted when 1111 account pair is used without compound mode
+    ; (Compound Mode Design Note §3.1: "Receiving 1111 in bits 33-36 = protocol error. Reject.")
+    err_compound_msg    db "bitpads: error: account pair 1111 (compound continuation) requires --compound flag", 10
+    err_compound_len    equ $ - err_compound_msg
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; layer3_build
+;   Construct the 5-byte Layer 3 BitLedger record from bp_ctx.
+;
+; Input:  rdi = pointer to bp_ctx
+;         rsi = pointer to 5-byte output buffer
+; Output: rax = 5  on success (always writes exactly 5 bytes)
+;         rax = -1 on protocol error (1111 pair without compound mode)
+; ─────────────────────────────────────────────────────────────────────────────
+layer3_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx                     ; rbx = bp_ctx pointer
+    push    r12                     ; r12 = output buffer pointer
+    sub     rsp, 8                  ; align stack
+
+    mov     rbx, rdi                ; save bp_ctx
+    mov     r12, rsi                ; save output buffer
+
+    ; ── Zero the 5-byte output buffer ─────────────────────────────────────
+    xor     eax, eax
+    mov     dword [r12 + 0], eax    ; zero bytes 0-3
+    mov     byte  [r12 + 4], al     ; zero byte 4
+
+    ; bytes[0..3] remain 0x00 — standard data record, no special control flags
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BYTE[4]: The key accounting classification byte
+    ; Contains: AccountPair(4) | Direction(2) | Completeness(1) | Extension(1)
+    ; ═══════════════════════════════════════════════════════════════════════
+    xor     al, al                  ; al = 0x00 — build byte[4] here
+
+    ; ── Account Pair (bits7-4): the double-entry relationship ──────────────
+    movzx   ecx, byte [rbx + BP_CTX_ACCT_PAIR]  ; ecx = account pair code (0-15)
+
+    ; COMPOUND RULE CHECK:
+    ; If account pair = 0x0F (1111 = compound continuation marker),
+    ; verify compound mode is active. If not, this is a protocol error.
+    cmp     cl, BP_ACCT_COMPOUND                ; is it 1111 (0x0F)?
+    jne     .acct_ok                            ; not compound marker → skip check
+
+    ; Account pair IS 1111 — verify compound mode is ON
+    cmp     byte [rbx + BP_CTX_COMPOUND], 0     ; is compound mode active?
+    jne     .acct_ok                            ; compound mode ON → 1111 is valid
+
+    ; Compound mode is OFF but 1111 was requested — PROTOCOL ERROR
+    ; "When compound mode = OFF: receiving 1111 = protocol error. Reject."
+    lea     rsi, [rel err_compound_msg]         ; rsi = error message string
+    mov     rdx, err_compound_len               ; rdx = message length
+    call    fileio_write_stderr                 ; print error to stderr
+
+    mov     rax, -1                             ; return -1 to signal caller of failure
+    jmp     .return
+
+.acct_ok:
+    ; Account pair is valid. Encode it into bits7-4 of byte[4].
+    and     cl, 0x0F                            ; mask to 4 bits (0-15)
+    shl     cl, 4                               ; shift to upper nibble
+                                               ; e.g. pair 0100 (Op Income/Asset) → 0x40
+    or      al, cl                              ; merge account pair into byte[4] upper nibble
+
+    ; ── Direction / Sub-type (bits3-2) ────────────────────────────────────
+    ; For standard pairs: direction of the flow (01=debit/source, 10=credit/sink, etc.)
+    ; For 1111 compound pair: sub-type (00=Standard, 01=Correcting, 10=Reversal, 11=Cross-batch)
+    movzx   ecx, byte [rbx + BP_CTX_DIRECTION]  ; ecx = 2-bit direction/sub-type
+    and     cl, 0x03                            ; mask to 2 bits
+    shl     cl, 2                               ; shift to bits3-2 position
+    or      al, cl                              ; merge direction into byte[4]
+
+    ; ── Completeness (bit1) ───────────────────────────────────────────────
+    ; "0=Full: standalone record, post immediately."
+    ; "1=Partial: enter compound watch, hold this record, expect 1111 next."
+    ; This bit is the mechanism that enforces atomic compound posting:
+    ; both records must arrive before either is posted to the ledger.
+    movzx   ecx, byte [rbx + BP_CTX_COMPLETENESS]  ; ecx = completeness flag (0 or 1)
+    and     cl, 0x01                               ; mask to 1 bit
+    shl     cl, 1                                  ; shift to bit1 position
+    or      al, cl                                 ; merge completeness
+
+    ; ── Extension flag (bit0) ─────────────────────────────────────────────
+    ; 0 = No extension byte follows (we don't emit one from this tool currently)
+    ; bit0 stays 0 — already clear from xor eax, eax above
+
+    mov     byte [r12 + 4], al                  ; store completed byte[4] into output buffer
+
+    mov     rax, BPv2_L3_SIZE                   ; return value = 5 (Layer 3 = 5 bytes)
+
+.return:
+    add     rsp, 8
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

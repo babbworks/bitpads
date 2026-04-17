@@ -1,0 +1,178 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; cmd1100.asm — Category 1100: Compact Command Encoder
+;
+; Reference: BitPads Enhancement Sub-Protocol §11
+;            "Category 1100 — Compact Command Sub-Protocol"
+;
+; Category 1100 (BP_CAT_COMPACT_CMD = 0x0C) is a NEW BitPads v2 category that
+; encodes operational commands in minimum bytes. It is used when the Wave frame
+; carries a command rather than a data value — the payload is a command opcode
+; and optional parameters, not a numeric measurement.
+;
+; COMPACT COMMAND FRAME STRUCTURE (after Meta Byte 1 + Meta Byte 2):
+;
+;   Byte 0: Command Byte
+;     bits 1-4 (0xF0): Command Class — 16 classes of commands
+;       0x00 = Lifecycle  — start/stop/pause/resume
+;       0x10 = Query      — request status or data
+;       0x20 = Configure  — set session or device parameters
+;       0x30 = Synchronise— time/state synchronisation
+;       0x40 = Diagnostic — health check and reporting
+;       0x50 = Security   — authentication / key exchange
+;       0x60 = Transfer   — initiate data or file transfer
+;       0x70 = Route      — topology and addressing commands
+;       0x80-0xE0 = Reserved (future standard command classes)
+;       0xF0 = Extended   — command class in next byte (8-bit extended code)
+;     bits 5-6 (0x0C): Parameter Count
+;       00 = no parameters
+;       01 = 1 parameter byte follows
+;       10 = 2 parameter bytes follow
+;       11 = variable: length byte follows, then N parameter bytes
+;     bit 7 (0x02): Response Required flag
+;       0 = fire-and-forget (no ACK or data response expected)
+;       1 = response required — sender expects reply before timeout
+;     bit 8 (0x01): Chained flag
+;       0 = standalone command
+;       1 = this command is part of a command sequence (more follow)
+;
+;   Bytes 1..N: Parameter bytes (0-2 inline, or length-prefixed for variable)
+;
+; STORAGE in bp_ctx (using reserved fields at BP_CTX_TASK_BYTE area):
+;   The CLI parser stores compact command data in:
+;     BP_CTX_TASK_BYTE    = command byte (class + param_count + flags)
+;     BP_CTX_TASK_BYTE+1  = param byte 0 (if present)
+;     BP_CTX_TASK_BYTE+2  = param byte 1 (if present)
+;
+; Exports: cmd1100_build
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global cmd1100_build
+
+; ── Compact Command constants ──────────────────────────────────────────────────
+; Command class codes (upper nibble of command byte)
+CMD_CLASS_LIFECYCLE  equ 0x00   ; lifecycle: START/STOP/PAUSE/RESUME
+CMD_CLASS_QUERY      equ 0x10   ; query: request status or value
+CMD_CLASS_CONFIGURE  equ 0x20   ; configure: set parameter
+CMD_CLASS_SYNC       equ 0x30   ; synchronise: time or state sync
+CMD_CLASS_DIAG       equ 0x40   ; diagnostic: health check
+CMD_CLASS_SECURITY   equ 0x50   ; security: auth / key exchange
+CMD_CLASS_TRANSFER   equ 0x60   ; transfer: data or file push/pull
+CMD_CLASS_ROUTE      equ 0x70   ; route: topology addressing
+CMD_CLASS_EXTENDED   equ 0xF0   ; extended: class in next byte
+
+; Parameter count codes (bits 5-6 of command byte)
+CMD_PARAMS_NONE      equ 0x00   ; no parameter bytes
+CMD_PARAMS_1         equ 0x04   ; 1 parameter byte
+CMD_PARAMS_2         equ 0x08   ; 2 parameter bytes
+CMD_PARAMS_VAR       equ 0x0C   ; variable: length byte + N param bytes
+
+; Response and chain flags
+CMD_RESP_REQ         equ 0x02   ; response required
+CMD_CHAINED          equ 0x01   ; more commands follow in sequence
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; cmd1100_build
+;   Build the Compact Command payload (command byte + optional parameter bytes).
+;   This function writes the PAYLOAD bytes only — Meta Byte 1 and 2 are written
+;   by the caller (build_wave.asm or build_record.asm) before calling this.
+;
+; Input:  rdi = pointer to bp_ctx
+;         rsi = pointer to output buffer
+; Output: rax = bytes written (1 to 4 depending on parameter count)
+; ─────────────────────────────────────────────────────────────────────────────
+cmd1100_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer
+    mov     r12, rsi                ; r12 = output buffer pointer
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BYTE 0: Command Byte
+    ;
+    ; The CLI pre-assembles the command byte into BP_CTX_TASK_BYTE.
+    ; (We reuse this field since compact commands never coexist with tasks
+    ; in the same record — category 1100 IS the record type.)
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE]  ; eax = command byte from ctx
+    mov     byte [r12 + 0], al                   ; write command byte to output
+                                                 ; e.g. 0x15 = Query class + 1 param + response req
+
+    mov     ecx, 1                  ; ecx = bytes written counter
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Determine parameter count from bits 5-6 of command byte (0x0C mask)
+    ; and write the appropriate number of parameter bytes.
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   edx, al                 ; edx = command byte (preserve for flag check)
+    and     dl, CMD_PARAMS_VAR      ; isolate parameter count field (bits 5-6)
+                                    ; result: 0x00, 0x04, 0x08, or 0x0C
+
+    cmp     dl, CMD_PARAMS_NONE     ; 00 = no parameters?
+    je      .done                   ; yes → command byte only, done
+
+    cmp     dl, CMD_PARAMS_1        ; 01 = 1 parameter byte?
+    je      .one_param
+
+    cmp     dl, CMD_PARAMS_2        ; 10 = 2 parameter bytes?
+    je      .two_params
+
+    ; 11 = CMD_PARAMS_VAR: variable — length byte follows, then N param bytes
+    ; For this implementation, the variable-length params are stored:
+    ;   BP_CTX_TASK_BYTE+1 = length N (0-255)
+    ;   BP_CTX_TASK_BYTE+2 .. +2+N-1 = parameter bytes
+    ; We only encode up to 2 variable params here (CLI limitation).
+.var_params:
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 1]  ; eax = variable param count
+    mov     byte [r12 + 1], al                        ; write length byte
+    inc     ecx
+
+    test    al, al                  ; any bytes to follow?
+    jz      .done
+
+    ; Copy variable parameter bytes (up to 2, CLI practical limit)
+    cmp     al, 1
+    jl      .done
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 2]  ; first variable param
+    mov     byte [r12 + rcx], al
+    inc     ecx
+
+    movzx   edx, byte [rbx + BP_CTX_TASK_BYTE + 1]  ; reload count
+    cmp     edx, 2
+    jl      .done
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 3]  ; second variable param
+    mov     byte [r12 + rcx], al
+    inc     ecx
+    jmp     .done
+
+.one_param:
+    ; Write the single parameter byte from ctx storage
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 1]  ; eax = param byte 0
+    mov     byte [r12 + 1], al                        ; write at offset 1
+                                                      ; e.g. device address, command sub-code
+    inc     ecx
+    jmp     .done
+
+.two_params:
+    ; Write two parameter bytes
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 1]  ; eax = param byte 0
+    mov     byte [r12 + 1], al                        ; write param 0
+    movzx   eax, byte [rbx + BP_CTX_TASK_BYTE + 2]  ; eax = param byte 1
+    mov     byte [r12 + 2], al                        ; write param 1
+    add     ecx, 2
+
+.done:
+    movzx   rax, ecx                ; rax = total bytes written
+
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

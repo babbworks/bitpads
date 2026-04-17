@@ -1,0 +1,105 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; main.asm — Program Entry Point for BitPads CLI
+;
+; macOS x86-64 entry point (_main)
+; Updated for modern macOS (Ventura / Sonoma / Sequoia / later)
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    extern cli_parse
+    extern dispatch_build
+
+    global _main
+
+section .data
+
+msg_ok      db "bitpads: transmission written successfully", 10
+msg_ok_len  equ $ - msg_ok
+
+msg_fail    db "bitpads: transmission failed — check arguments and output path", 10
+msg_fail_len equ $ - msg_fail
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; _main
+;   Program entry point called by macOS runtime.
+;
+; Input:  rdi = argc
+;         rsi = argv
+; Output: exits with appropriate code (0=success, 1=arg error, 2=build error)
+; ─────────────────────────────────────────────────────────────────────────────
+_main:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+
+    ; ── Parse command-line arguments ──────────────────────────────────────
+    ; cli_parse returns:
+    ;   rdi = pointer to populated bp_ctx
+    ;   rax = 0 on success, -1 if required args missing
+    call    cli_parse
+
+    mov     rbx, rdi                ; rbx = &bp_ctx (preserve across calls)
+
+    test    eax, eax
+    jl      .parse_fail             ; rax = -1 → usage already printed
+
+    ; ── Dispatch to correct builder based on --type ───────────────────────
+    xor     r12d, r12d
+    movzx   r12d, byte [rbx + BP_CTX_COUNT]
+    test    r12d, r12d
+    jnz     .dispatch_loop
+    mov     r12d, 1
+
+.dispatch_loop:
+    mov     rdi, rbx
+    call    dispatch_build          ; rax = 0 success, -1 on build error
+
+    test    eax, eax
+    jl      .build_fail
+    dec     r12d
+    jnz     .dispatch_loop
+
+    ; ── Success path ──────────────────────────────────────────────────────
+    cmp     byte [rbx + BP_CTX_PRINT_SIZE], 0
+    jne     .ok_quiet
+    mov     rax, SYS_WRITE
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_ok]
+    mov     rdx, msg_ok_len
+    syscall
+.ok_quiet:
+
+    xor     edi, edi                ; exit code 0 = success
+    jmp     .exit
+
+.parse_fail:
+    ; cli_parse already printed usage to stderr
+    mov     edi, 1                  ; exit code 1 = argument error
+    jmp     .exit
+
+.build_fail:
+    ; builder already printed specific error (e.g. compound protocol error)
+    mov     rax, SYS_WRITE
+    mov     rdi, STDERR
+    lea     rsi, [rel msg_fail]
+    mov     rdx, msg_fail_len
+    syscall
+
+    mov     edi, 2                  ; exit code 2 = build/protocol error
+
+.exit:
+    ; ── Exit the process cleanly ──────────────────────────────────────────
+    mov     rax, SYS_EXIT
+    syscall                         ; kernel exit — never returns
+
+    ; Unreachable safety code
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

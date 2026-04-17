@@ -1,0 +1,146 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; meta2.asm — Meta Byte 2 Builder
+;
+; Reference: BitPads Protocol v2 §3.1–3.3
+;
+; Meta Byte 2 is present in every Record mode transmission immediately after
+; Meta Byte 1. Together the two Meta bytes form 16 bits that fully declare the
+; record structure before a single byte of payload arrives.
+;
+; Bit layout:
+;
+;   Bits 1-4 (0xF0): Archetype / Sub-type
+;     When category=1001 (Archetype Stream): active BitLedger archetype (0-15)
+;     Other categories: sub-type or sub-category declaration
+;     We store this in BP_CTX_CATEGORY (upper nibble = archetype when relevant)
+;
+;   Bits 5-6 (0x0C): Time Reference Selector
+;     00 (0x00) = No timestamp in this record
+;     01 (0x04) = Tier 1, session offset (8-bit value follows components)
+;     10 (0x08) = Tier 1, external reference (e.g. mission epoch)
+;     11 (0x0C) = Tier 2 Time Block (variable length, full temporal spec)
+;
+;   Bit 7 (0x02): Setup Byte Present
+;     0 = Use session/Layer 2 defaults (Tier 3, SF x1, D=2)
+;     1 = Setup byte follows before Value block, overriding defaults
+;
+;   Bit 8 (0x01): Signal Slot Presence (v2.0 — reassigned from Reserved=1)
+;     0 = No signal slots in this record (common case, no overhead)
+;     1 = Signal Slot Presence byte follows Meta byte 2, before Layer 1
+;
+; Exports: meta2_build
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global meta2_build
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; meta2_build
+;   Construct Meta Byte 2 from bp_ctx.
+;
+; Input:  rdi = pointer to bp_ctx
+; Output: al  = completed Meta Byte 2 byte
+; ─────────────────────────────────────────────────────────────────────────────
+meta2_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer (callee-saved)
+    xor     eax, eax                ; al = 0x00 — clean slate
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BITS 1-4 (0xF0): Archetype / Sub-type
+    ;
+    ; The upper nibble of Meta Byte 2. For archetype streams, this carries
+    ; the active BitLedger flow archetype (0000=Source-to-Sink, etc.).
+    ; For other record categories, it carries sub-type information.
+    ;
+    ; We use BP_CTX_CATEGORY as the archetype source (lower nibble = category,
+    ; but for archetype stream records the value 0-15 maps directly).
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   ecx, byte [rbx + BP_CTX_ARCHETYPE] ; ecx = dedicated archetype code
+    and     cl, 0x0F                            ; mask to 4 bits (categories are 0-15)
+    shl     cl, 4                               ; shift left 4: place in bits 1-4 (upper nibble)
+                                               ; e.g. archetype 0x05 → 0x50 in upper nibble
+    or      al, cl                             ; merge archetype/sub-type into byte
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BITS 5-6 (0x0C): Time Reference Selector
+    ;
+    ; Controls which time tier is used and what the reference epoch is.
+    ; Value comes from BP_CTX_TIME_TIER in the context structure.
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   ecx, byte [rbx + BP_CTX_TIME_TIER]  ; ecx = time tier code (0-3)
+
+    cmp     cl, 1                               ; is it Tier 1 session offset?
+    je      .time_t1_sess
+    cmp     cl, 2                               ; is it Tier 1 external reference?
+    je      .time_t1_ext
+    cmp     cl, 3                               ; is it Tier 2 Time Block?
+    je      .time_t2
+    jmp     .time_done                          ; 0 = no timestamp, bits 5-6 stay 00
+
+.time_t1_sess:
+    or      al, BPv2_META2_TIMESEL_T1S          ; 0x04 = bits5-6 = 01 = Tier1 session offset
+                                               ; "Most common case: 8-bit offset from session open"
+    jmp     .time_done
+
+.time_t1_ext:
+    or      al, BPv2_META2_TIMESEL_T1E          ; 0x08 = bits5-6 = 10 = Tier1 external ref
+                                               ; "8-bit offset from mission epoch or system time"
+    jmp     .time_done
+
+.time_t2:
+    or      al, BPv2_META2_TIMESEL_T2           ; 0x0C = bits5-6 = 11 = Tier2 Time Block
+                                               ; "Full temporal spec: timestamp + task timing + validity"
+
+.time_done:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BIT 7 (0x02): Setup Byte Present
+    ;
+    ; The setup byte is needed whenever value encoding deviates from session
+    ; defaults (Tier 3, SF=x1, D=2). Check if any non-default value encoding
+    ; is requested in ctx.
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   ecx, byte [rbx + BP_CTX_VALUE_TIER] ; ecx = tier (0=T1,1=T2,2=T3,3=T4)
+    cmp     cl, 2                               ; is it NOT the default Tier 3?
+    jne     .need_setup                         ; non-default tier → need setup byte
+
+    movzx   ecx, byte [rbx + BP_CTX_SF_INDEX]   ; ecx = scaling factor index
+    test    cl, cl                              ; is SF non-default (not x1 = index 0)?
+    jnz     .need_setup                         ; non-unity scaling → need setup byte
+
+    movzx   ecx, byte [rbx + BP_CTX_DP]         ; ecx = decimal positions
+    cmp     cl, 2                               ; is DP non-default (not 2 decimal places)?
+    jne     .need_setup                         ; non-default DP → need setup byte
+    jmp     .no_setup                           ; all defaults: no setup byte needed
+
+.need_setup:
+    or      al, BPv2_META2_SETUP                ; set bit 7 (0x02) = setup byte follows
+                                               ; "1=Setup byte follows before Value block"
+
+.no_setup:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BIT 8 (0x01): Signal Slot Presence
+    ;
+    ; v2.0 change: bit 8 was previously Reserved=1. Now it flags whether a
+    ; Signal Slot Presence byte follows Meta Byte 2 (before Layer 1).
+    ; Only set if signal slots P4-P8 are actually being used.
+    ; ═══════════════════════════════════════════════════════════════════════
+    cmp     byte [rbx + BP_CTX_SIGNAL_SLOTS], 0 ; are any signal slots active?
+    je      .no_slots                           ; 0 = no slots, bit 8 stays 0 (common case)
+    or      al, BPv2_META2_SLOTS                ; set bit 8 (0x01) = presence byte follows
+                                               ; "1=Signal Slot Presence byte follows Meta byte 2"
+
+.no_slots:
+    ; al = complete Meta Byte 2
+
+    pop     rbx
+    pop     rbp
+    ret

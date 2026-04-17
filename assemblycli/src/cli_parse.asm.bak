@@ -1,0 +1,646 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; cli_parse.asm — Command-Line Argument Parser
+;
+; Parses argv[] into a bp_ctx structure. Every recognised flag maps to one or
+; more fields in the context block.  Unknown flags are silently ignored so that
+; future flag additions do not break older callers.
+;
+; SUPPORTED FLAGS:
+;   --type <signal|wave|record|ledger>   BP_CTX_TYPE
+;   --domain <fin|eng|hybrid|custom>     BP_CTX_DOMAIN
+;   --sender <hex32>                     BP_CTX_SENDER_ID (32-bit hex, e.g. 0xDEAD1234)
+;   --subentity <0-31>                   BP_CTX_SUB_ENTITY
+;   --category <0-15>                    BP_CTX_CATEGORY (Wave Role B category)
+;   --value <uint32>                     BP_CTX_VALUE + BP_CTX_VALUE_PRES
+;   --tier <1|2|3|4>                     BP_CTX_VALUE_TIER
+;   --sf <0|1|2|3>                       BP_CTX_SF_INDEX (x1/x1k/x1M/x1B)
+;   --dp <0|2|4|6>                       BP_CTX_DP
+;   --time <0-255>                       BP_CTX_TIME_VAL + BP_CTX_TIME_PRES
+;   --time-tier <0|1|2|3>               BP_CTX_TIME_TIER
+;   --task <hex8>                        BP_CTX_TASK_BYTE + BP_CTX_TASK_PRES
+;   --note <string>                      BP_CTX_NOTE_DATA + BP_CTX_NOTE_LEN + PRES
+;   --acct <0-15>                        BP_CTX_ACCT_PAIR
+;   --dir <0-3>                          BP_CTX_DIRECTION
+;   --compound                           BP_CTX_COMPOUND = 1
+;   --complete                           BP_CTX_COMPLETENESS = 1
+;   --ack                                BP_CTX_ACK_REQ = 1
+;   --cont                               BP_CTX_CONT = 1
+;   --prio                               BP_CTX_PRIO = 1
+;   --layer2                             BP_CTX_LAYER2_PRES = 1
+;   --setup                              forces setup byte (set via Meta2)
+;   --enhance                            BP_CTX_ENHANCEMENT = 1
+;   --perms <0-15>                       BP_CTX_PERMISSIONS (4-bit read/write/corr/proxy)
+;   --split <0|1|2>                      BP_CTX_SPLIT_MODE
+;   --out <filename>                     BP_CTX_OUTFILE
+;   --trace                              BP_CTX_HEX_TRACE = 1
+;
+; PARSING APPROACH:
+;   We iterate over argv[1..argc-1].  Each argument is compared against known
+;   flag strings using byte-by-byte comparison.  For flags that take a value
+;   argument, the next argv entry is parsed as a decimal or hex integer.
+;
+; Exports: cli_parse
+; Input:   rdi = argc (int), rsi = argv (char**)
+; Output:  rdi = pointer to bp_ctx (address of the static ctx block)
+;          rax = 0 on success, -1 if required args missing
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global cli_parse
+
+section .data
+
+; ── Error / usage message ─────────────────────────────────────────────────────
+usage_msg   db "Usage: bitpads --type <signal|wave|record|ledger> --out <file> [options]", 10
+            db "Options:", 10
+            db "  --domain <fin|eng|hybrid|custom>", 10
+            db "  --sender <hex32>   --subentity <0-31>", 10
+            db "  --category <0-15>  --value <uint32>   --tier <1-4>", 10
+            db "  --sf <0-3>         --dp <0|2|4|6>", 10
+            db "  --time <0-255>     --time-tier <0-3>", 10
+            db "  --task <hex8>      --note <text>", 10
+            db "  --acct <0-15>      --dir <0-3>", 10
+            db "  --ack  --cont  --prio  --compound  --complete", 10
+            db "  --layer2  --enhance  --perms <0-15>  --split <0-2>", 10
+            db "  --trace", 10
+usage_len   equ $ - usage_msg
+
+; ── Known flag strings (null-terminated) ─────────────────────────────────────
+; Keep these aligned for efficient comparison.  Shorter strings go first.
+flag_type      db "--type",      0
+flag_domain    db "--domain",    0
+flag_sender    db "--sender",    0
+flag_sub       db "--subentity", 0
+flag_cat       db "--category",  0
+flag_value     db "--value",     0
+flag_tier      db "--tier",      0
+flag_sf        db "--sf",        0
+flag_dp        db "--dp",        0
+flag_time      db "--time",      0
+flag_timetier  db "--time-tier", 0
+flag_task      db "--task",      0
+flag_note      db "--note",      0
+flag_acct      db "--acct",      0
+flag_dir       db "--dir",       0
+flag_compound  db "--compound",  0
+flag_complete  db "--complete",  0
+flag_ack       db "--ack",       0
+flag_cont      db "--cont",      0
+flag_prio      db "--prio",      0
+flag_layer2    db "--layer2",    0
+flag_enhance   db "--enhance",   0
+flag_perms     db "--perms",     0
+flag_split     db "--split",     0
+flag_out       db "--out",       0
+flag_trace     db "--trace",     0
+
+; ── Domain name strings ───────────────────────────────────────────────────────
+dom_fin    db "fin",    0
+dom_eng    db "eng",    0
+dom_hyb    db "hybrid", 0
+dom_cust   db "custom", 0
+
+; ── Type name strings ─────────────────────────────────────────────────────────
+typ_signal  db "signal",  0
+typ_wave    db "wave",    0
+typ_record  db "record",  0
+typ_ledger  db "ledger",  0
+
+section .bss
+    the_ctx     resb BP_CTX_SIZE    ; the single bp_ctx structure for this process
+                                    ; zero-initialised by the OS at startup (BSS section)
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Helper: streq
+;   Compare two null-terminated strings.
+;   rdi = string 1, rsi = string 2
+;   Returns: ZF set if equal, ZF clear if not equal
+;   Clobbers: rax, rcx
+; ─────────────────────────────────────────────────────────────────────────────
+streq:
+.loop:
+    movzx   eax, byte [rdi]         ; load next char from string 1
+    movzx   ecx, byte [rsi]         ; load next char from string 2
+    cmp     al, cl                  ; do they match?
+    jne     .neq                    ; no → strings differ
+    test    al, al                  ; end of string?
+    jz      .eq                     ; yes → equal (both hit null together)
+    inc     rdi                     ; advance both pointers
+    inc     rsi
+    jmp     .loop
+.eq:
+    cmp     al, al                  ; set ZF=1 (equal)
+    ret
+.neq:
+    or      al, 1                   ; clear ZF (not equal) — cmp al,1 will not set ZF
+    cmp     al, 0                   ; ZF=0 if al≠0 (which it is after `or al,1`)
+    ret
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Helper: parse_uint32
+;   Parse a null-terminated ASCII decimal or hex ("0x...") number.
+;   rdi = pointer to string
+;   Returns: rax = parsed value (32-bit, zero-extended into rax)
+;   Clobbers: rax, rcx, rdx, rsi
+; ─────────────────────────────────────────────────────────────────────────────
+parse_uint32:
+    xor     eax, eax                ; accumulator = 0
+    movzx   ecx, byte [rdi]         ; first character
+
+    ; Check for "0x" hex prefix
+    cmp     cl, '0'
+    jne     .decimal_loop           ; not '0' → parse decimal
+    movzx   ecx, byte [rdi + 1]
+    cmp     cl, 'x'
+    je      .hex_prefix
+    cmp     cl, 'X'
+    jne     .decimal_loop           ; "0" followed by non-x → decimal
+
+.hex_prefix:
+    add     rdi, 2                  ; skip past "0x"
+.hex_loop:
+    movzx   ecx, byte [rdi]
+    test    cl, cl
+    jz      .done_parse             ; null terminator → done
+    cmp     cl, '0'
+    jl      .done_parse
+    cmp     cl, '9'
+    jle     .hex_digit
+    cmp     cl, 'a'
+    jl      .check_upper_hex
+    cmp     cl, 'f'
+    jg      .done_parse
+    sub     cl, 'a' - 10            ; 'a'-'f' → 10-15
+    jmp     .hex_accumulate
+.check_upper_hex:
+    cmp     cl, 'A'
+    jl      .done_parse
+    cmp     cl, 'F'
+    jg      .done_parse
+    sub     cl, 'A' - 10            ; 'A'-'F' → 10-15
+    jmp     .hex_accumulate
+.hex_digit:
+    sub     cl, '0'                 ; '0'-'9' → 0-9
+.hex_accumulate:
+    shl     eax, 4                  ; accumulator <<= 4
+    or      al, cl                  ; accumulator |= digit
+    inc     rdi
+    jmp     .hex_loop
+
+.decimal_loop:
+    movzx   ecx, byte [rdi]
+    test    cl, cl
+    jz      .done_parse
+    cmp     cl, '0'
+    jl      .done_parse
+    cmp     cl, '9'
+    jg      .done_parse
+    sub     cl, '0'                 ; convert ASCII digit to integer
+    imul    eax, eax, 10            ; accumulator *= 10
+    add     eax, ecx                ; accumulator += digit
+    inc     rdi
+    jmp     .decimal_loop
+
+.done_parse:
+    ret
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Helper: copy_string
+;   Copy at most 63 bytes from rsi into [rdi], null-terminate.
+;   Clobbers: rax, rcx
+; ─────────────────────────────────────────────────────────────────────────────
+copy_string:
+    xor     ecx, ecx
+.cs_loop:
+    cmp     ecx, 63                 ; limit to 63 bytes
+    jge     .cs_null
+    movzx   eax, byte [rsi + rcx]
+    test    al, al
+    jz      .cs_null
+    mov     byte [rdi + rcx], al
+    inc     ecx
+    jmp     .cs_loop
+.cs_null:
+    mov     byte [rdi + rcx], 0     ; null-terminate
+    ret
+
+; ─────────────────────────────────────────────────────────────────────────────
+; cli_parse
+;   Main argument parsing entry point.
+;
+; Input:  rdi = argc (number of arguments including argv[0])
+;         rsi = argv  (array of char* pointers)
+; Output: rdi = &the_ctx (pointer to the populated bp_ctx)
+;         rax = 0 on success, -1 if --type or --out not provided
+; ─────────────────────────────────────────────────────────────────────────────
+cli_parse:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8                  ; align stack
+
+    ; ── Preserve argc and argv ────────────────────────────────────────────
+    mov     r14d, edi               ; r14d = argc
+    mov     r15, rsi                ; r15  = argv
+
+    ; ── Set bp_ctx defaults ───────────────────────────────────────────────
+    ; BSS is zero-initialised, but we set explicit meaningful defaults here.
+    lea     rbx, [the_ctx]          ; rbx = &the_ctx
+
+    mov     byte [rbx + BP_CTX_TYPE],       BP_TYPE_WAVE    ; default: Wave transmission
+    mov     byte [rbx + BP_CTX_DOMAIN],     BP_DOMAIN_FIN   ; default: Financial domain
+    mov     byte [rbx + BP_CTX_VALUE_TIER], 2               ; default: Tier 3 (24-bit value)
+    mov     byte [rbx + BP_CTX_SF_INDEX],   0               ; default: x1 scaling factor
+    mov     byte [rbx + BP_CTX_DP],         2               ; default: 2 decimal places
+
+    ; ── Main parse loop: iterate argv[1..argc-1] ──────────────────────────
+    mov     r12d, 1                 ; r12d = argv index, starts at 1 (skip argv[0])
+
+.arg_loop:
+    cmp     r12d, r14d              ; have we processed all arguments?
+    jge     .parse_done
+
+    mov     r13, [r15 + r12 * 8]   ; r13 = argv[r12] = pointer to current argument string
+    inc     r12d                    ; pre-advance to next (will be used for value args)
+
+    ; ── Test each known flag ───────────────────────────────────────────────
+    ; We use the streq helper which preserves rdi/rsi on the call but we
+    ; reload r13 before each comparison. The actual check clobbers rdi/rsi.
+
+    ; --type
+    lea     rdi, [flag_type]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_domain
+    mov     r13, [r15 + r12 * 8]   ; r13 = value argument (next argv)
+    inc     r12d
+    lea     rdi, [typ_signal]
+    mov     rsi, r13
+    call    streq
+    jne     .type_wave
+    mov     byte [rbx + BP_CTX_TYPE], BP_TYPE_SIGNAL
+    jmp     .arg_loop
+.type_wave:
+    lea     rdi, [typ_wave]
+    mov     rsi, r13
+    call    streq
+    jne     .type_record
+    mov     byte [rbx + BP_CTX_TYPE], BP_TYPE_WAVE
+    jmp     .arg_loop
+.type_record:
+    lea     rdi, [typ_record]
+    mov     rsi, r13
+    call    streq
+    jne     .type_ledger
+    mov     byte [rbx + BP_CTX_TYPE], BP_TYPE_RECORD
+    jmp     .arg_loop
+.type_ledger:
+    mov     byte [rbx + BP_CTX_TYPE], BP_TYPE_LEDGER
+    jmp     .arg_loop
+
+.chk_domain:
+    lea     rdi, [flag_domain]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_sender
+    mov     r13, [r15 + r12 * 8]
+    inc     r12d
+    lea     rdi, [dom_fin]
+    mov     rsi, r13
+    call    streq
+    jne     .dom_eng
+    mov     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_FIN
+    jmp     .arg_loop
+.dom_eng:
+    lea     rdi, [dom_eng]
+    mov     rsi, r13
+    call    streq
+    jne     .dom_hyb
+    mov     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_ENG
+    jmp     .arg_loop
+.dom_hyb:
+    lea     rdi, [dom_hyb]
+    mov     rsi, r13
+    call    streq
+    jne     .dom_cust
+    mov     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_HYBRID
+    jmp     .arg_loop
+.dom_cust:
+    mov     byte [rbx + BP_CTX_DOMAIN], BP_DOMAIN_CUSTOM
+    jmp     .arg_loop
+
+.chk_sender:
+    lea     rdi, [flag_sender]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_sub
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32            ; rax = 32-bit sender ID
+    mov     dword [rbx + BP_CTX_SENDER_ID], eax
+    jmp     .arg_loop
+
+.chk_sub:
+    lea     rdi, [flag_sub]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_cat
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x1F                ; mask to 5 bits (0-31)
+    mov     byte [rbx + BP_CTX_SUB_ENTITY], al
+    jmp     .arg_loop
+
+.chk_cat:
+    lea     rdi, [flag_cat]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_value
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x0F                ; mask to 4 bits (0-15)
+    mov     byte [rbx + BP_CTX_CATEGORY], al
+    jmp     .arg_loop
+
+.chk_value:
+    lea     rdi, [flag_value]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_tier
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    mov     dword [rbx + BP_CTX_VALUE], eax
+    mov     byte  [rbx + BP_CTX_VALUE_PRES], 1
+    jmp     .arg_loop
+
+.chk_tier:
+    lea     rdi, [flag_tier]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_sf
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    dec     eax                     ; convert 1-based (T1=1) to 0-based (T1=0)
+    and     al, 0x03                ; clamp to 0-3
+    mov     byte [rbx + BP_CTX_VALUE_TIER], al
+    jmp     .arg_loop
+
+.chk_sf:
+    lea     rdi, [flag_sf]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_dp
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x03
+    mov     byte [rbx + BP_CTX_SF_INDEX], al
+    jmp     .arg_loop
+
+.chk_dp:
+    lea     rdi, [flag_dp]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_time
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x07                ; clamp: valid values 0, 2, 4, 6
+    mov     byte [rbx + BP_CTX_DP], al
+    jmp     .arg_loop
+
+.chk_time:
+    lea     rdi, [flag_time]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_timetier
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    mov     byte [rbx + BP_CTX_TIME_VAL], al
+    mov     byte [rbx + BP_CTX_TIME_PRES], 1
+    cmp     byte [rbx + BP_CTX_TIME_TIER], 0  ; if tier not set yet, default to Tier 1
+    jne     .arg_loop
+    mov     byte [rbx + BP_CTX_TIME_TIER], 1   ; default time tier = T1 session offset
+    jmp     .arg_loop
+
+.chk_timetier:
+    lea     rdi, [flag_timetier]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_task
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x03
+    mov     byte [rbx + BP_CTX_TIME_TIER], al
+    jmp     .arg_loop
+
+.chk_task:
+    lea     rdi, [flag_task]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_note
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    mov     byte [rbx + BP_CTX_TASK_BYTE], al
+    mov     byte [rbx + BP_CTX_TASK_PRES], 1
+    jmp     .arg_loop
+
+.chk_note:
+    lea     rdi, [flag_note]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_acct
+    mov     rsi, [r15 + r12 * 8]   ; rsi = note string pointer
+    inc     r12d
+    ; Measure note length (up to 63 bytes)
+    xor     ecx, ecx
+.note_len_loop:
+    cmp     ecx, 63
+    jge     .note_len_done
+    cmp     byte [rsi + rcx], 0
+    je      .note_len_done
+    inc     ecx
+    jmp     .note_len_loop
+.note_len_done:
+    mov     byte [rbx + BP_CTX_NOTE_LEN], cl
+    mov     byte [rbx + BP_CTX_NOTE_PRES], 1
+    ; Copy note bytes into ctx
+    lea     rdi, [rbx + BP_CTX_NOTE_DATA]
+    call    copy_string             ; copies up to 63 bytes from rsi to rdi
+    jmp     .arg_loop
+
+.chk_acct:
+    lea     rdi, [flag_acct]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_dir
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x0F
+    mov     byte [rbx + BP_CTX_ACCT_PAIR], al
+    jmp     .arg_loop
+
+.chk_dir:
+    lea     rdi, [flag_dir]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_compound
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x03
+    mov     byte [rbx + BP_CTX_DIRECTION], al
+    jmp     .arg_loop
+
+.chk_compound:
+    lea     rdi, [flag_compound]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_complete
+    mov     byte [rbx + BP_CTX_COMPOUND], 1    ; enable compound mode
+    jmp     .arg_loop
+
+.chk_complete:
+    lea     rdi, [flag_complete]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_ack
+    mov     byte [rbx + BP_CTX_COMPLETENESS], 1  ; partial record
+    jmp     .arg_loop
+
+.chk_ack:
+    lea     rdi, [flag_ack]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_cont
+    mov     byte [rbx + BP_CTX_ACK_REQ], 1
+    jmp     .arg_loop
+
+.chk_cont:
+    lea     rdi, [flag_cont]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_prio
+    mov     byte [rbx + BP_CTX_CONT], 1
+    jmp     .arg_loop
+
+.chk_prio:
+    lea     rdi, [flag_prio]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_layer2
+    mov     byte [rbx + BP_CTX_PRIO], 1
+    jmp     .arg_loop
+
+.chk_layer2:
+    lea     rdi, [flag_layer2]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_enhance
+    mov     byte [rbx + BP_CTX_LAYER2_PRES], 1
+    jmp     .arg_loop
+
+.chk_enhance:
+    lea     rdi, [flag_enhance]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_perms
+    mov     byte [rbx + BP_CTX_ENHANCEMENT], 1
+    jmp     .arg_loop
+
+.chk_perms:
+    lea     rdi, [flag_perms]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_split
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x0F                ; mask to 4 bits (read/write/correct/proxy)
+    mov     byte [rbx + BP_CTX_PERMISSIONS], al
+    jmp     .arg_loop
+
+.chk_split:
+    lea     rdi, [flag_split]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_out
+    mov     rdi, [r15 + r12 * 8]
+    inc     r12d
+    call    parse_uint32
+    and     al, 0x03
+    mov     byte [rbx + BP_CTX_SPLIT_MODE], al
+    jmp     .arg_loop
+
+.chk_out:
+    lea     rdi, [flag_out]
+    mov     rsi, r13
+    call    streq
+    jne     .chk_trace
+    ; Copy output filename (up to 63 chars) into ctx
+    mov     rsi, [r15 + r12 * 8]   ; rsi = filename string pointer
+    inc     r12d
+    lea     rdi, [rbx + BP_CTX_OUTFILE]
+    call    copy_string
+    jmp     .arg_loop
+
+.chk_trace:
+    lea     rdi, [flag_trace]
+    mov     rsi, r13
+    call    streq
+    jne     .unknown_flag           ; not a known flag — skip silently
+    mov     byte [rbx + BP_CTX_HEX_TRACE], 1
+    jmp     .arg_loop
+
+.unknown_flag:
+    ; Silently ignore unrecognised flags — forward-compatible parsing.
+    jmp     .arg_loop
+
+.parse_done:
+    ; ── Validate required fields ───────────────────────────────────────────
+    ; --out is required: BP_CTX_OUTFILE must be non-empty
+    cmp     byte [rbx + BP_CTX_OUTFILE], 0  ; first byte of filename = 0?
+    je      .missing_out
+
+    ; Validation passed — return ctx pointer
+    lea     rdi, [the_ctx]          ; rdi = &the_ctx (return value for dispatch.asm)
+    xor     eax, eax                ; rax = 0 (success)
+    jmp     .done
+
+.missing_out:
+    ; Print usage to stderr and return -1
+    mov     rax, SYS_WRITE
+    mov     rdi, STDERR
+    lea     rsi, [usage_msg]
+    mov     rdx, usage_len
+    syscall
+
+    lea     rdi, [the_ctx]          ; still return ctx pointer (partially filled)
+    mov     eax, -1                 ; return -1 to signal caller
+
+.done:
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

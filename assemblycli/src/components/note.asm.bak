@@ -1,0 +1,154 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; note.asm — Note Component Encoder
+;
+; Reference: BitPads Protocol v2 §8.2 — Note Component
+;
+; The Note component attaches human-readable or machine-readable annotation
+; to a record. It is present when Meta Byte 1 bit 8 (BPv2_META1_ROLC_NOTE = 0x01)
+; is set in the record header.
+;
+; STRUCTURE:
+;   Byte 0: Note Header byte — encoding type, language hint, length field
+;   Bytes 1..N: Note content bytes (variable length, 0-63 bytes inline)
+;
+; NOTE HEADER BYTE (8 bits):
+;
+;   bits 1-2 (0xC0): Encoding type
+;     00 (BP_NOTE_ENC_UTF8)   = UTF-8 encoded text     — most common
+;     01 (BP_NOTE_ENC_ASCII)  = 7-bit ASCII text        — pure ASCII
+;     10 (BP_NOTE_ENC_PICTOG) = Pictogram code sequence — icon/symbol stream
+;     11 (BP_NOTE_ENC_STREAM) = Stream reference        — points to open text stream
+;
+;   bits 3-4 (0x30): Language hint
+;     00 = session default language (declared in session profile)
+;     01-03 = profile-defined language codes (e.g. 01=EN, 02=FR, 03=session-specific)
+;
+;   bits 5-8 (0x0F): Inline length
+;     0x00-0x0E = inline byte count of note content follows immediately (0-14 bytes)
+;     0x0F      = overflow: actual length is in the NEXT byte (allows 0-255 bytes)
+;
+; EXAMPLE:
+;   BP_NOTE_ENC_UTF8 | 0x00 (default lang) | 5 (length)  = 0x05
+;   Followed by 5 bytes: 'H','e','l','l','o'
+;
+; STORAGE in bp_ctx:
+;   BP_CTX_NOTE_LEN  (offset 24): note length in bytes (0-63)
+;   BP_CTX_NOTE_DATA (offset 25): up to 63 bytes of note content + null terminator
+;                                 The encoding type is set by the upper bits of
+;                                 BP_CTX_NOTE_DATA[0] .. wait, no:
+;                                 The encoding/language are derived from a separate
+;                                 packing convention:
+;                                   BP_CTX_NOTE_LEN stores length (0-63)
+;                                   Encoding is always BP_NOTE_ENC_UTF8 by default
+;                                   Language is always 00 (session default) by default
+;
+; Exports: note_build
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global note_build
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; note_build
+;   Encode the Note component into the output buffer from bp_ctx.
+;
+; Input:  rdi = pointer to bp_ctx
+;         rsi = pointer to output buffer
+; Output: rax = total bytes written (1 header + 0-N content bytes)
+;
+; The encoding type is always UTF-8 and language is always session-default
+; (bits 1-4 = 0x00) in this implementation. The CLI can extend this.
+; ─────────────────────────────────────────────────────────────────────────────
+note_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+    push    r13
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer (callee-saved)
+    mov     r12, rsi                ; r12 = output buffer pointer (callee-saved)
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Read the note length from bp_ctx
+    ; BP_CTX_NOTE_LEN stores the actual byte count of the note content.
+    ; Maximum supported inline length: 63 bytes (0x3F).
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   r13d, byte [rbx + BP_CTX_NOTE_LEN]  ; r13d = note content length in bytes
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BYTE 0: Note Header Byte
+    ;
+    ; Assemble: encoding(2) | language(2) | length_field(4)
+    ;
+    ; For this implementation:
+    ;   Encoding = UTF-8 = 00 = 0x00 (most common, safe for all ASCII/Unicode text)
+    ;   Language = 00 = session default (declared in session open, not per-note)
+    ;   Length   = see below
+    ;
+    ; Length field encoding:
+    ;   If note length ≤ 14 (0x0E): encode directly in bits 5-8 (lower nibble)
+    ;   If note length > 14:        encode 0x0F in bits 5-8, then write length in byte 1
+    ; ═══════════════════════════════════════════════════════════════════════
+    xor     eax, eax                ; eax = 0x00 (UTF-8 + default language, bits 1-4 clear)
+                                    ; "00=UTF-8 encoded text — most common"
+
+    cmp     r13d, 14                ; is length ≤ 14 (fits in 4-bit inline field)?
+    jg      .length_overflow        ; no → use overflow encoding (0x0F + extra byte)
+
+    ; Short path: length fits in 4-bit field (0-14)
+    or      al, r13b                ; embed length directly in lower nibble of header
+                                    ; e.g. length=5 → header = 0x05 (UTF-8, default lang, 5 bytes)
+    mov     byte [r12 + 0], al      ; write note header byte
+    mov     ecx, 1                  ; ecx = bytes written so far (just the header)
+    jmp     .copy_content           ; proceed to copy note content bytes
+
+.length_overflow:
+    ; Long path: length > 14 — use overflow marker in header then length byte
+    or      al, 0x0F                ; set lower nibble = 1111 = "length follows in next byte"
+                                    ; "0xF means length in next byte" (Protocol v2 §8.2)
+    mov     byte [r12 + 0], al      ; write header byte with overflow marker
+    mov     byte [r12 + 1], r13b    ; write actual length in following byte (0-255 range)
+                                    ; e.g. 20 bytes → header=0x0F, length_byte=20
+    mov     ecx, 2                  ; ecx = bytes written (header + length byte)
+
+.copy_content:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Copy note content bytes from bp_ctx to output buffer
+    ;
+    ; Source: [rbx + BP_CTX_NOTE_DATA] = up to 63 content bytes
+    ; Dest:   [r12 + rcx] = next available position in output buffer
+    ; Count:  r13d bytes to copy
+    ; ═══════════════════════════════════════════════════════════════════════
+    test    r13d, r13d              ; is there any content to copy?
+    jz      .done                   ; note length = 0 → only header byte written
+
+    ; Set up for byte-by-byte copy loop
+    xor     edx, edx                ; edx = loop index (0 .. r13d-1)
+
+.copy_loop:
+    cmp     edx, r13d               ; have we copied all content bytes?
+    jge     .done                   ; yes → exit loop
+
+    ; Copy one byte from note data buffer to output buffer
+    movzx   eax, byte [rbx + BP_CTX_NOTE_DATA + rdx]  ; eax = note content byte at index rdx
+    mov     byte [r12 + rcx], al                        ; write to output at current position
+                                                        ; e.g. 'H','e','l','l','o' for a 5-byte note
+    inc     ecx                     ; advance output position
+    inc     edx                     ; advance source index
+    jmp     .copy_loop              ; continue until all bytes copied
+
+.done:
+    ; Return total bytes written: header (1 or 2) + content bytes
+    movzx   rax, ecx                ; rax = total bytes written
+
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

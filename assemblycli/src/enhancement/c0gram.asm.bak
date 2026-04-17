@@ -1,0 +1,179 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; c0gram.asm — C0 Enhancement Grammar Builder
+;
+; Reference: BitPads Enhancement Sub-Protocol §4–5
+;            "C0 Enhancement Grammar — Enhanced C0 byte structure"
+;
+; The Enhancement Sub-Protocol upgrades ASCII C0 control bytes (0x00-0x1F) into
+; three-flag carriers. Each enhanced C0 byte packs:
+;
+;   bit 1 (0x80): Priority flag   — elevate processing urgency for this signal
+;   bit 2 (0x40): ACK Request     — receiver must confirm receipt of this signal
+;   bit 3 (0x20): Continuation    — more C0 bytes follow in the same signal slot
+;   bits 4-8 (0x1F): C0 Identity  — the 5-bit C0 code (0=NUL, 1=SOH, 7=BEL, etc.)
+;
+; This is the "enhanced" form. The "raw" form is the plain 0x00-0x1F value.
+; An enhanced byte is ONLY valid when the session enhancement flag is active
+; (BPv2_L1_ENHANCE was set in Layer 1, and BP_CTX_ENHANCEMENT is set in ctx).
+;
+; KEY INVARIANT:
+;   A C0 byte whose bits 4-8 are zero AND bits 1-3 are zero = 0x00 = NUL.
+;   The decoder disambiguates enhanced vs. raw by context (session enhancement flag).
+;
+; This module provides:
+;   c0gram_encode  — pack flags + C0 code identity into one enhanced byte
+;   c0gram_decode  — unpack an enhanced byte into its three flag fields + C0 code
+;   c0gram_build_slot — build a complete signal slot sequence into an output buffer
+;
+; Exports: c0gram_encode, c0gram_decode, c0gram_build_slot
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global c0gram_encode
+    global c0gram_decode
+    global c0gram_build_slot
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; c0gram_encode
+;   Pack a C0 identity code and three flag bits into a single enhanced byte.
+;
+; Input:  dil = C0 code identity (0-31, see C0_* constants in bitpads.inc)
+;         sil = flags byte: bits 0-2 encode PRIO|ACK|CONT (bit2=PRIO, bit1=ACK, bit0=CONT)
+;               Use the following masks for the flags argument:
+;                 0x04 = Priority flag
+;                 0x02 = ACK Request flag
+;                 0x01 = Continuation flag
+; Output: al  = enhanced C0 byte ready to place in signal slot
+;
+; Example: c0gram_encode(C0_BEL, 0x04) → 0x80 | 0x07 = 0x87 (priority BEL)
+; ─────────────────────────────────────────────────────────────────────────────
+c0gram_encode:
+    ; Build the enhanced byte: flags in upper 3 bits, code in lower 5 bits.
+    ; The flags argument bit layout maps to the output byte positions:
+    ;   input bit 2 (0x04) → output bit 7 (0x80) = Priority flag
+    ;   input bit 1 (0x02) → output bit 6 (0x40) = ACK Request flag
+    ;   input bit 0 (0x01) → output bit 5 (0x20) = Continuation flag
+
+    movzx   eax, dil                ; eax = C0 code identity (5 bits, 0-31)
+    and     al,  C0_CODE_MASK       ; mask to exactly 5 bits (safety: caller may pass >31)
+                                    ; "bits 4-8 = C0 code identity field (values 0-31)"
+
+    movzx   ecx, sil                ; ecx = raw flags (bits 2-0 from caller)
+    and     cl,  0x07               ; mask to 3 bits (safety)
+    shl     cl,  5                  ; shift left 5 to reach bits 7-5 position
+                                    ; input 0x04 → 0x04<<5 = 0x80 (Priority)
+                                    ; input 0x02 → 0x02<<5 = 0x40 (ACK)
+                                    ; input 0x01 → 0x01<<5 = 0x20 (Continuation)
+    or      al,  cl                 ; merge flags into upper 3 bits of enhanced byte
+                                    ; result: [PRIO|ACK|CONT|code4|code3|code2|code1|code0]
+    ret
+
+; ─────────────────────────────────────────────────────────────────────────────
+; c0gram_decode
+;   Unpack an enhanced C0 byte into its component parts.
+;
+; Input:  dil = enhanced C0 byte
+; Output: al  = C0 code identity (0-31, lower 5 bits)
+;         ah  = flags byte (bits 2-0: PRIO|ACK|CONT — same encoding as c0gram_encode input)
+;
+; Note: callers typically inspect al (what signal) and ah (how urgent/chained).
+; ─────────────────────────────────────────────────────────────────────────────
+c0gram_decode:
+    movzx   eax, dil                ; eax = enhanced byte input
+
+    ; Extract C0 code identity (lower 5 bits)
+    mov     ah,  al                 ; save full byte in ah temporarily
+    and     al,  C0_CODE_MASK       ; al = C0 identity (bits 4-8 = lower 5 bits)
+                                    ; e.g. 0x87 → 0x87 & 0x1F = 0x07 = C0_BEL
+
+    ; Extract flags (upper 3 bits → shift down to bits 2-0 of ah)
+    shr     ah,  5                  ; shift upper 3 bits to positions 2-0
+                                    ; e.g. 0x87 >> 5 = 0x04 (Priority bit set)
+                                    ; flags in ah: bit2=PRIO, bit1=ACK, bit0=CONT
+    ret
+
+; ─────────────────────────────────────────────────────────────────────────────
+; c0gram_build_slot
+;   Build the enhanced C0 byte sequence for a single signal slot.
+;
+;   A slot may carry 1-3 enhanced C0 bytes. The CONTINUATION flag (0x20) in
+;   each byte signals whether more bytes follow in this slot:
+;     CONT=1 → another byte follows in this slot
+;     CONT=0 → this is the last (or only) byte in this slot
+;
+; Input:  rdi = pointer to signal data array (1-3 raw enhanced bytes pre-assembled by caller)
+;         rsi = pointer to output buffer
+;         edx = number of bytes in the slot (1, 2, or 3)
+; Output: rax = bytes written
+;
+; This function enforces the CONT flag protocol:
+;   Bytes 1..(N-1) have CONT flag forced ON (0x20 set)
+;   Byte N has CONT flag forced OFF (0x20 cleared) — "last in slot"
+; ─────────────────────────────────────────────────────────────────────────────
+c0gram_build_slot:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+    push    r13
+
+    mov     rbx, rdi                ; rbx = source signal bytes pointer
+    mov     r12, rsi                ; r12 = output buffer pointer
+    mov     r13d, edx               ; r13d = number of bytes to emit
+
+    ; Clamp to valid slot size (1-3 bytes per slot per protocol definition)
+    test    r13d, r13d
+    jz      .done_zero              ; 0 bytes → nothing to write
+    cmp     r13d, 3
+    jle     .count_ok
+    mov     r13d, 3                 ; enforce maximum of 3 bytes per slot
+                                    ; "each slot carries 1-3 enhanced C0 bytes"
+.count_ok:
+    xor     ecx, ecx                ; ecx = loop index
+
+.slot_loop:
+    cmp     ecx, r13d               ; have we written all bytes?
+    jge     .done
+
+    movzx   eax, byte [rbx + rcx]  ; eax = pre-assembled enhanced byte from source array
+
+    ; Enforce CONT flag for all bytes except the last
+    lea     edx, [r13d - 1]        ; edx = index of last byte (count-1)
+    cmp     ecx, edx               ; is this the last byte?
+    je      .last_byte             ; yes → clear CONT flag
+
+    ; Not last byte — set CONT flag to signal more bytes follow in this slot
+    or      al, C0_FLAG_CONT        ; force CONT bit ON = 0x20
+                                    ; "CONT=1: another enhanced byte follows in this slot"
+    jmp     .write_byte
+
+.last_byte:
+    ; Last byte in slot — clear CONT flag to terminate the slot sequence
+    and     al, ~C0_FLAG_CONT       ; force CONT bit OFF
+                                    ; "CONT=0: this is the final byte in this slot"
+
+.write_byte:
+    mov     byte [r12 + rcx], al   ; write the (possibly modified) enhanced byte
+    inc     ecx
+    jmp     .slot_loop
+
+.done:
+    movzx   rax, r13d              ; rax = bytes written
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret
+
+.done_zero:
+    xor     eax, eax
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

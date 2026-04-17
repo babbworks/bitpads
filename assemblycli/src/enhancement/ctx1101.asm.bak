@@ -1,0 +1,80 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; ctx1101.asm — Category 1101: Context Declaration Encoder
+; Safe register version for macOS NASM (no eax/al mixing)
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global ctx1101_build
+
+; Context class codes
+CTX_CLASS_CURRENCY   equ 0x00
+CTX_CLASS_IDENTITY   equ 0x20
+CTX_CLASS_TIMEREF    equ 0x40
+CTX_CLASS_PROFILE    equ 0x60
+CTX_CLASS_DOMAIN     equ 0x80
+CTX_CLASS_EXTENDED   equ 0xE0
+
+CTX_ACK_REQ          equ 0x10
+
+section .text
+
+ctx1101_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer
+    mov     r12, rsi                ; r12 = output buffer pointer
+
+    ; BYTE 0: Context Class Byte
+    mov     r8b, byte [rbx + BP_CTX_TASK_BYTE]
+    mov     byte [r12 + 0], r8b
+    mov     ecx, 1
+
+    ; Extract class (upper 3 bits)
+    mov     r9b, r8b
+    and     r9b, 0xE0
+
+    cmp     r9b, CTX_CLASS_CURRENCY
+    je      .done
+
+    cmp     r9b, CTX_CLASS_IDENTITY
+    je      .done
+
+    cmp     r9b, CTX_CLASS_TIMEREF
+    je      .time_ref
+
+    ; Other classes have no additional payload in this implementation
+    jmp     .done
+
+.time_ref:
+    ; 4-byte big-endian epoch
+    mov     r8d, dword [rbx + BP_CTX_TASK_BYTE + 1]
+
+    mov     r9d, r8d
+    shr     r9d, 24
+    mov     byte [r12 + 1], r9b
+
+    mov     r9d, r8d
+    shr     r9d, 16
+    mov     byte [r12 + 2], r9b
+
+    mov     r9d, r8d
+    shr     r9d, 8
+    mov     byte [r12 + 3], r9b
+
+    mov     r9b, r8b
+    mov     byte [r12 + 4], r9b
+
+    add     ecx, 4
+
+.done:
+    movzx   rax, ecx
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret
