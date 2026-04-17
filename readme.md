@@ -1,55 +1,37 @@
-# BitLedger
+# BitPads
 
-**A binary protocol family for verifiable transmission of any conserved quantity — financial, physical, or relational — in the most demanding environments on Earth or beyond.**
+**A universal binary communication protocol — from a single heartbeat byte to a fully identified, timestamped, valued, tasked, and annotated civilisational record — in as few as one byte.**
 
 ---
 
 ## What This Is
 
-BitLedger is a suite of binary communication protocols built from first principles at the mathematical foundation of information exchange. A complete financial transaction — both sides of the double-entry, accounting classification, direction, settlement status, value, precision, and currency — encodes in **40 bits**. A full engineering telemetry event — propellant mass, power obligations, and mission status — transmits in the same structure, reusing the same 40-bit wire format unchanged.
+BitPads is the outermost layer of a binary protocol family built from first principles at the mathematical foundation of information exchange. A single Meta byte declares everything that follows — mode, content type, expect flags, enhancement state — before the receiver reads a single payload byte. A transmission can be a one-byte heartbeat or a fully specified 44-byte record carrying identity, time, value, task, and annotation. The protocol scales from deep space telemetry to high-frequency industrial control without changing its structure.
 
-The project spans three protocol layers and a companion meta-layer, each derived from the same insight: **every meaningful exchange of value between entities is a conservation law**. Money conserved. Mass conserved. Energy conserved. Data conserved. The same algebraic invariant that governs double-entry accounting governs Kirchhoff's current law, mass balance equations, and momentum transfer in mechanical systems. BitLedger encodes that invariant directly at the wire level — not as a rule the application must enforce, but as a property of the encoding itself.
+At its core sits **BitLedger** — a binary financial and physical transmission protocol where a complete double-entry transaction encodes in **40 bits**. The same 40-bit wire format that carries a financial transaction carries propellant mass, power obligations, data packets, and mission status. BitPads wraps and extends that core across every transmission context.
 
----
-
-## The Protocol Family
-
-### BitLedger Protocol v3.0
-*Binary financial transmission. 40 bits per transaction.*
-
-A minimal double-entry accounting record and transmission standard. Every bit position carries defined meaning. The rules of double-entry accounting are enforced at the encoding level. Three independent error detection mechanisms operate on every record without a separate checksum field.
-
-[→ Full specification: `docs/BitLedger_Protocol_v3.docx`]
+The project spans four protocol layers, each derived from the same insight: **every meaningful exchange of value between entities is a conservation law**. Money conserved. Mass conserved. Energy conserved. Data conserved. The same algebraic invariant that governs double-entry accounting governs Kirchhoff's current law, mass balance equations, and momentum transfer in mechanical systems. The protocol encodes that invariant directly at the wire level — not as a rule the application must enforce, but as a property of the encoding itself.
 
 ---
 
-### BitLedger Universal Domain v1.0
-*Any conserved scalar. Any engineered system.*
-
-The financial specification generalised. The same 40-bit record that carries dollars and cents carries kilograms of propellant, watt-hours of power, data packets, contractual obligations between satellites, or service-hours owed between nodes in a robot swarm. The wire format is byte-for-byte identical. The semantic interpretation changes. The conservation invariant holds in all cases.
-
-**What changes:** the 4-bit account pair field becomes a 16-archetype relationship matrix covering every canonical flow type between any two entities in any man-made system. Source-to-Sink. Debtor-to-Creditor. Transformation. Distribution. Aggregation. The algebra is the same. The domain is unlimited.
-
-[→ Full specification: `docs/BitLedger_Universal_Domain.docx`]
-
----
+## Protocol Layers
 
 ### BitPads Protocol v2.0
 *Universal 8-bit meta layer. One byte to forty-four.*
 
-BitPads wraps BitLedger. A single Meta byte declares everything that follows — mode, content type, expect flags, enhancement state — before the receiver reads a single payload byte. A transmission can be a one-byte heartbeat or a fully identified, timestamped, valued, tasked, and annotated record. The protocol scales from deep space telemetry to high-frequency industrial control without changing its structure.
+The outermost layer. A single Meta byte declares everything that follows before the receiver reads a single payload byte. The protocol scales from a one-byte heartbeat to a fully identified, timestamped, valued, tasked, and annotated record without changing its structure.
 
 **The transmission spectrum:**
 
-| Size | Type | Contents |
-|------|------|----------|
-| 1 byte | Pure Signal | Heartbeat, ACK request, status flag |
-| 4 bytes | Anonymous Value | Session-context value, no identity overhead |
-| 13 bytes | Minimal Full Record | Identity + value, new session |
-| 29 bytes | Full Record | All four components: value, time, task, note |
-| 28 bytes | Full BitLedger | Complete double-entry record in BitPads |
+| Size     | Type                | Contents                                     |
+| -------- | ------------------- | -------------------------------------------- |
+| 1 byte   | Pure Signal         | Heartbeat, ACK request, status flag          |
+| 4 bytes  | Anonymous Value     | Session-context value, no identity overhead  |
+| 13 bytes | Minimal Full Record | Identity + value, new session                |
+| 29 bytes | Full Record         | All four components: value, time, task, note |
+| 28 bytes | Full BitLedger      | Complete double-entry record in BitPads      |
 
-[→ Full specification: `docs/BitPads_Protocol_v2.docx`]
+[→ Full specification: `docs/BitPads_Protocol_v2.md`]
 
 ---
 
@@ -62,7 +44,48 @@ Thirteen signal slot positions span the full transmission structure — session 
 
 **The binary pictography connection:** a stream with a declared category identity allows the receiver to decode compact nibble sequences as full semantic events through a shared codebook. Four bits per symbol. Sixteen concepts per codebook. The Sumerian accounting principle — minimal mark, rich shared context — implemented in binary at sub-byte precision.
 
-[→ Full specification: `docs/BitPads_Enhancement_Subprotocol_v2.docx`]
+[→ Full specification: `docs/BitPads_Enhancement_Subprotocol_v2.md`]
+
+---
+
+### BitLedger Protocol v3.0
+*Binary financial transmission. 40 bits per transaction.*
+
+A minimal double-entry accounting record and transmission standard. Every bit position carries defined meaning. The rules of double-entry accounting are enforced at the encoding level. Three independent error detection mechanisms operate on every record without a separate checksum field.
+
+[→ Full specification: `docs/BitLedger_Protocol_v3.md`]
+
+---
+
+### BitLedger Universal Domain v1.0
+*Any conserved scalar. Any engineered system.*
+
+The financial specification generalised. The same 40-bit record that carries dollars and cents carries kilograms of propellant, watt-hours of power, data packets, contractual obligations between satellites, or service-hours owed between nodes in a robot swarm. The wire format is byte-for-byte identical. The semantic interpretation changes. The conservation invariant holds in all cases.
+
+**What changes:** the 4-bit account pair field becomes a 16-archetype relationship matrix covering every canonical flow type between any two entities in any man-made system. Source-to-Sink. Debtor-to-Creditor. Transformation. Distribution. Aggregation. The algebra is the same. The domain is unlimited.
+
+[→ Full specification: `docs/BitLedger_Universal_Domain.md`]
+
+---
+
+### Compound Mode Design Note
+*Linking records into logical transactions.*
+
+Compound mode is a session-level permission that allows the `1111` account pair code to appear as a continuation marker, linking the current record to its predecessor as part of one logical multi-leg event. Documents the design tradeoff and correct implementation.
+
+[→ Full specification: `docs/BitLedger_CompoundMode_DesignNote.md`]
+
+---
+
+## Document Index
+
+| Document | Format | Description |
+|----------|--------|-------------|
+| `docs/BitPads_Protocol_v2.md` | Markdown | BitPads meta-layer specification |
+| `docs/BitPads_Enhancement_Subprotocol_v2.md` | Markdown | C0 enhancement grammar and signal slots |
+| `docs/BitLedger_Protocol_v3.md` | Markdown | Core 40-bit financial protocol |
+| `docs/BitLedger_Universal_Domain.md` | Markdown | Universal domain generalisation |
+| `docs/BitLedger_CompoundMode_DesignNote.md` | Markdown | Compound mode design note |
 
 ---
 
@@ -83,7 +106,7 @@ The reduction is structural, not compressive. No decompression step. No schema l
 
 ### Error Detection That Goes Deeper
 
-Three independent mechanisms on every 40-bit record:
+Three independent mechanisms on every 40-bit BitLedger record:
 
 1. **CRC-15** on the session header — polynomial `x^15 + x + 1`, covering sender identity, domain, permissions, and all session defaults
 2. **Cross-layer validation** — direction and status flags mirrored in both the value block and the accounting block; a single-bit flip in either location is immediately detectable
@@ -121,14 +144,14 @@ The protocol family draws from 5,000 years of communication engineering:
 
 **Microservices at the wire level.** Every optional capability costs zero when absent. Signal slots, System Context extensions, Setup bytes, Time blocks, Task components — none of these inflate a transmission that does not need them. The 4-byte anonymous value Wave and the 44-byte fully-specified Record use the same Meta byte architecture. Complexity attaches on demand.
 
-**Legacy compatible by design.** A BitPads Telegraph Emulation stream transmits bytes 0-31 as genuine C0 controls. A legacy teleprinter or terminal receiving the same byte stream sees standard controls throughout — BEL rings, FS separates files, EOT closes the transmission. A BitPads receiver reads the enhancement flags in the upper 3 bits of bytes 32-255 and decodes rich typed events from the same stream.
+**Legacy compatible by design.** A BitPads Telegraph Emulation stream transmits bytes 0–31 as genuine C0 controls. A legacy teleprinter or terminal receiving the same byte stream sees standard controls throughout — BEL rings, FS separates files, EOT closes the transmission. A BitPads receiver reads the enhancement flags in the upper 3 bits of bytes 32–255 and decodes rich typed events from the same stream.
 
 ---
 
 ## The Numbers
 
 ```
-Maximum value in a single 40-bit record:
+Maximum value in a single 40-bit BitLedger record:
   ~$33.5 quadrillion  (approximately 305 × global GDP)
 
 Maximum nodes in a session (flat Sender ID):
@@ -147,8 +170,8 @@ C0 controls in the agreed enhancement set:
   29 unconditional  +  4 conditional  =  33 total
 
 Protocol family documents:
-  6  (BitLedger v3, Universal Domain, Technical Overview,
-      BitPads v2, Enhancement Sub-Protocol v2, Compound Mode Design Note)
+  5  (BitLedger v3, Universal Domain, Compound Mode Design Note,
+      BitPads v2, Enhancement Sub-Protocol v2)
 ```
 
 ---
@@ -161,6 +184,8 @@ The answer is 40 bits. Every bit earns its position. The structure that results 
 
 The protocol did not set out to be universal. It became universal because the conservation invariant is universal.
 
+BitPads wraps that universal core — giving any transmission context, identity, time, intent, and meaning, at exactly the cost of what it expresses.
+
 ---
 
-*BitLedger is under active development. Specifications are versioned. All wire format changes are logged in the Protocol Change Log (Appendix D of the Enhancement Sub-Protocol).*
+*BitPads is under active development. Specifications are versioned. All wire format changes are logged in the Protocol Change Log (Appendix D of the Enhancement Sub-Protocol).*
