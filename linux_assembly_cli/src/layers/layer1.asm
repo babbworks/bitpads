@@ -1,0 +1,218 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; layer1.asm — Layer 1 Session Header Builder
+;
+; Reference: BitPads Protocol v2 §4.1–4.4
+;
+; Layer 1 is the 64-bit (8-byte) session initialisation block. It provides:
+;   - The SOH bootstrap anchor (byte 0x01 in IDLE state opens session)
+;   - Domain declaration (Financial / Engineering / Hybrid / Custom)
+;   - Permission flags (Read/Write/Correct/Proxy)
+;   - Sender identity (32-bit Node ID with configurable split modes)
+;   - Sub-entity ID (5-bit department or sub-system)
+;   - CRC-15 integrity checksum (x^15+x+1 over bits 1-49)
+;   - Session Enhancement Flag (v2.0: enables C0 grammar for whole session)
+;
+; Bit layout across 8 bytes (protocol bit 1 = x86 bit 7):
+;
+;   byte[0] bit7  (L1 bit 1):  SOH Marker = always 1
+;   byte[0] bit6  (L1 bit 2):  Wire Format Version = 0 (v1 current)
+;   byte[0] bits5-4 (bits 3-4): Domain: 00=Financial 01=Engineering 10=Hybrid 11=Custom
+;   byte[0] bits3-0 (bits 5-8): Permissions: Read|Write|Correct|Proxy
+;
+;   byte[1] bit7  (bit 9):  Split Order Default (0=multiplicand first)
+;   byte[1] bits6-5 (bits 10-11): Sender ID Split Mode
+;   byte[1] bit4  (bit 12): Session Enhancement Flag (v2.0)
+;   byte[1] bits3-0 (bits 13-16): Sender ID bits 31-28 (MSB nibble)
+;
+;   byte[2] (bits 17-24): Sender ID bits 27-20
+;   byte[3] (bits 25-32): Sender ID bits 19-12
+;   byte[4] (bits 33-40): Sender ID bits 11-4
+;   byte[5] bits7-4 (bits 41-44): Sender ID bits 3-0
+;   byte[5] bits3-0 (bits 45-48): Sub-Entity ID bits 4-1
+;   byte[6] bit7   (bit 49):  Sub-Entity ID bit 0 (LSB)
+;   byte[6] bits6-0 (bits 50-56): CRC-15 bits 14-8 (upper 7 bits of CRC)
+;   byte[7] (bits 57-64): CRC-15 bits 7-0 (lower 8 bits of CRC)
+;
+; Exports: layer1_build
+; Requires: crc15_embed (extern)
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    extern crc15_embed
+
+    global layer1_build
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; layer1_build
+;   Construct the 8-byte Layer 1 Session Header from bp_ctx.
+;
+; Input:  rdi = pointer to bp_ctx
+;         rsi = pointer to 8-byte output buffer (caller allocates)
+; Output: rax = 8 (always writes exactly 8 bytes)
+;
+; After this function, the CRC-15 is embedded in bytes 6-7 by crc15_embed.
+; ─────────────────────────────────────────────────────────────────────────────
+layer1_build:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx                     ; rbx = bp_ctx pointer
+    push    r12                     ; r12 = output buffer pointer
+    push    r13                     ; r13 = temporary scratch
+    sub     rsp, 8                  ; align stack to 16 bytes before calls
+
+    mov     rbx, rdi                ; save bp_ctx pointer
+    mov     r12, rsi                ; save output buffer pointer
+
+    ; ── Zero the entire 8-byte output buffer ──────────────────────────────
+    ; Start clean; we build each byte by OR-ing in fields.
+    xor     eax, eax                ; rax = 0 — use as zero source
+    mov     qword [r12], rax        ; zero bytes[0..7] in one 64-bit write
+                                   ; (the entire Layer 1 block starts as all zeros)
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BYTE[0]: SOH + Version + Domain + Permissions
+    ; ═══════════════════════════════════════════════════════════════════════
+
+    ; Bit 7 (0x80): SOH Marker — ALWAYS 1, the bootstrap anchor
+    ; "In IDLE state byte 0x01 unconditionally opens Layer 1 read."
+    mov     byte [r12 + 0], BPv2_L1_SOH        ; 0x80 — bit 7 set, all others clear for now
+
+    ; Bit 6 (0x40): Wire Format Version — 0 = version 1 (current)
+    ; We leave bit 6 clear (version 0 = current).
+
+    ; Bits 5-4 (0x30): Domain encoding
+    ; 00=Financial(0x00) 01=Engineering(0x10) 10=Hybrid(0x20) 11=Custom(0x30)
+    movzx   eax, byte [rbx + BP_CTX_DOMAIN]    ; eax = domain code (0-3)
+    shl     al, 4                              ; shift domain to bits 5-4 position
+                                              ; domain=1(eng) → 0x10, domain=2(hyb) → 0x20
+    and     al, BPv2_L1_DOMAIN                ; mask to bits 5-4 only (safety)
+    or      byte [r12 + 0], al                ; merge domain into byte[0]
+
+    ; Bits 3-0 (0x0F): Permissions (Read | Write | Correct | Proxy)
+    ; Each permission = 1 bit in the lower nibble of byte[0]
+    movzx   eax, byte [rbx + BP_CTX_PERMISSIONS]  ; eax = 4-bit permissions
+    and     al, 0x0F                              ; mask to lower nibble (4 bits, bits 3-0)
+    or      byte [r12 + 0], al                    ; merge permissions into byte[0]
+                                                  ; e.g. Read+Write = 0x03 in lower nibble
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BYTE[1]: Split Order + ID Split Mode + Enhancement Flag + Sender ID[31:28]
+    ; ═══════════════════════════════════════════════════════════════════════
+
+    ; Bit 7 of byte[1] = protocol bit 9 = Split Order Default
+    ; 0 = multiplicand first (default), 1 = multiplier first
+    ; We leave bit 7 clear (default split order)
+
+    ; Bits 6-5 of byte[1] = protocol bits 10-11 = Sender ID Split Mode
+    movzx   eax, byte [rbx + BP_CTX_SPLIT_MODE]   ; eax = split mode (0-3)
+    shl     al, 5                                  ; shift to bits 6-5 position (0b_xx0_0000)
+                                                   ; split=1 (16/16) → 0x20, split=2 → 0x40
+    or      byte [r12 + 1], al                     ; merge split mode into byte[1]
+
+    ; Bit 4 of byte[1] = protocol bit 12 = Session Enhancement Flag (v2.0)
+    ; "0=No C0 Enhancement Grammar. 1=Enhancement active session-wide."
+    cmp     byte [rbx + BP_CTX_ENHANCEMENT], 0     ; is enhancement requested?
+    je      .no_enhance                             ; 0 = no, skip
+    or      byte [r12 + 1], BPv2_L1_ENHANCE        ; set bit 4 (0x10) = enhancement active
+                                                   ; "All 13 signal slot positions P1-P13 available"
+.no_enhance:
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; SENDER ID (32 bits) packed into bits 13-44 of Layer 1
+    ;
+    ; Sender ID spans: byte[1] bits 3-0 + bytes[2..5] + byte[5] bits 7-4
+    ; But actually bytes 2-5 plus the nibble:
+    ;   byte[1] bits3-0 = sender_id bits 31-28  (top nibble of sender_id)
+    ;   byte[2]          = sender_id bits 27-20  (next byte)
+    ;   byte[3]          = sender_id bits 19-12
+    ;   byte[4]          = sender_id bits 11-4
+    ;   byte[5] bits7-4  = sender_id bits 3-0    (bottom nibble of sender_id)
+    ; ═══════════════════════════════════════════════════════════════════════
+    mov     eax, dword [rbx + BP_CTX_SENDER_ID]   ; eax = 32-bit sender ID (stored LE in ctx)
+                                                  ; e.g. sender 0xDEADBEEF → eax=0xDEADBEEF
+
+    ; Extract sender_id[31:28] → byte[1] bits3-0 (the lower nibble of byte[1])
+    mov     r13d, eax               ; r13 = sender_id copy
+    shr     r13d, 28                ; r13 = upper 4 bits of sender_id (bits 31-28)
+                                   ; e.g. 0xDEADBEEF >> 28 = 0xD
+    and     r13b, 0x0F             ; mask to 4 bits (safety)
+    or      byte [r12 + 1], r13b   ; merge into byte[1] lower nibble
+                                   ; byte[1] now = split_mode | enhancement | sender_top_nibble
+
+    ; sender_id[27:20] → byte[2]
+    mov     r13d, eax              ; r13 = sender_id
+    shr     r13d, 20               ; shift right 20: bits 27-20 are now in r13b
+    and     r13b, 0xFF             ; mask to 8 bits
+    mov     byte [r12 + 2], r13b   ; store as byte[2]
+                                   ; e.g. 0xDEADBEEF: bits27-20 = 0xEA
+
+    ; sender_id[19:12] → byte[3]
+    mov     r13d, eax
+    shr     r13d, 12               ; shift right 12: bits 19-12 now in r13b
+    and     r13b, 0xFF
+    mov     byte [r12 + 3], r13b   ; e.g. 0xDEADBEEF: bits19-12 = 0xDB
+
+    ; sender_id[11:4] → byte[4]
+    mov     r13d, eax
+    shr     r13d, 4                ; shift right 4: bits 11-4 now in r13b
+    and     r13b, 0xFF
+    mov     byte [r12 + 4], r13b   ; e.g. 0xDEADBEEF: bits11-4 = 0xEE
+
+    ; sender_id[3:0] → byte[5] bits7-4 (upper nibble of byte[5])
+    mov     r13d, eax
+    and     r13d, 0x0F             ; r13b = lower 4 bits of sender_id (bits 3-0)
+    shl     r13b, 4                ; shift to upper nibble of byte[5]
+    or      byte [r12 + 5], r13b   ; merge into byte[5] upper nibble
+                                   ; e.g. 0xDEADBEEF: bits3-0 = 0xF → 0xF0 in upper nibble
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; SUB-ENTITY ID (5 bits) packed into bits 45-49 of Layer 1
+    ;
+    ;   byte[5] bits3-0 = sub_entity_id bits 4-1  (upper 4 bits of sub-entity)
+    ;   byte[6] bit7    = sub_entity_id bit 0      (LSB of sub-entity = protocol bit 49)
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   eax, byte [rbx + BP_CTX_SUB_ENTITY]   ; eax = 5-bit sub-entity (0-31)
+                                                  ; e.g. department 3 = 0b00011
+
+    ; sub_entity bits 4-1 → byte[5] bits 3-0 (lower nibble of byte[5])
+    mov     r13d, eax
+    shr     r13b, 1                ; r13b = sub_entity >> 1 → bits 4-1 are now in positions 3-0
+    and     r13b, 0x0F             ; mask to 4 bits
+    or      byte [r12 + 5], r13b   ; merge into byte[5] lower nibble
+
+    ; sub_entity bit 0 → byte[6] bit7 (MSB of byte[6] = protocol bit 49, last data bit)
+    test    al, 0x01               ; is sub-entity LSB set?
+    jz      .no_sub_lsb
+    or      byte [r12 + 6], 0x80   ; set bit7 of byte[6] = last data bit before CRC
+.no_sub_lsb:
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; CRC-15: Compute over bits 1-49 and embed in bits 50-64
+    ;
+    ; crc15_embed(rdi=buf) reads bytes[0..6], computes CRC over 49 bits,
+    ; and writes:
+    ;   byte[6] = (byte[6] & 0x80) | (crc >> 8)   ; preserve data bit, store upper CRC
+    ;   byte[7] = crc & 0xFF                        ; store lower CRC byte
+    ;
+    ; After this call, Layer 1 is complete with valid integrity protection.
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Compute CRC-15 over bits 1-49 and embed into bits 50-64 of the Layer 1 buffer.
+    ; crc15_embed(rdi=buf): reads bytes[0..6], writes CRC into bytes[6-7].
+    ;   byte[6] = (byte[6] & 0x80) | (crc >> 8)   ; preserve sub-entity LSB in bit7
+    ;   byte[7] = crc & 0xFF
+    mov     rdi, r12                ; rdi = Layer 1 output buffer (bytes 0-6 filled, byte[7] = 0)
+    call    crc15_embed             ; compute CRC-15 and pack into bytes[6-7]
+
+    mov     rax, BPv2_L1_SIZE      ; return value = 8 (Layer 1 is always exactly 8 bytes)
+
+    add     rsp, 8
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret

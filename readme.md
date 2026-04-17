@@ -23,13 +23,27 @@ The outermost layer. A single Meta byte declares everything that follows before 
 
 **The transmission spectrum:**
 
-| Size     | Type                | Contents                                     |
-| -------- | ------------------- | -------------------------------------------- |
-| 1 byte   | Pure Signal         | Heartbeat, ACK request, status flag          |
-| 4 bytes  | Anonymous Value     | Session-context value, no identity overhead  |
-| 13 bytes | Minimal Full Record | Identity + value, new session                |
-| 29 bytes | Full Record         | All four components: value, time, task, note |
-| 28 bytes | Full BitLedger      | Complete double-entry record in BitPads      |
+| Size      | Type                | Contents                                     |
+|-----------|---------------------|----------------------------------------------|
+| 1 byte    | Pure Signal         | Heartbeat, ACK request, status flag          |
+| 4 bytes   | Anonymous Value     | Session-context value, no identity overhead  |
+| 13 bytes  | Minimal Full Record | Identity + value, new session                |
+| 29 bytes  | Full Record         | All four components: value, time, task, note |
+| 22+ bytes | Full BitLedger      | Complete double-entry record in BitPads (see below) |
+
+**Full BitLedger component breakdown:**
+
+| Component | Description | Bytes |
+|-----------|-------------|-------|
+| Meta byte 1 | Universal transmission header | 1 |
+| Meta byte 2 | Extended record context | 1 |
+| Layer 1 | Session init — Sender ID, permissions, domain, CRC-15 | 8 |
+| Layer 2 | Batch header — currency, scaling, precision, separators, rounding balance | 6 |
+| Session Config Extension | Compound mode, BL block optional, opposing convention, nesting level | 1–5 |
+| Layer 3 | The BitLedger record — value, flags, accounting classification | 5 |
+| **Minimum total** | | **22** |
+
+The spec's own footprint table cites **28 bytes (224 bits)** for a full BitLedger record in BitPads. The irreducible minimum of the named components is 22 bytes; the path to 28 depends on which Session Config Extension sub-fields are treated as mandatory for a given session configuration (nesting declaration, opposing convention extension, system context block). The spec notation `28+` confirms this is a floor, not a fixed size — complexity attaches on demand.
 
 [→ Full specification: `docs/BitPads_Protocol_v2.md`]
 

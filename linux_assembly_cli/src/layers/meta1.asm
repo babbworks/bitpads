@@ -1,0 +1,160 @@
+; ═══════════════════════════════════════════════════════════════════════════════
+; meta1.asm — Meta Byte 1 Builder
+;
+; Reference: BitPads Protocol v2 §2.1–2.4
+;
+; Meta Byte 1 is the FIRST BYTE of every single BitPads transmission without
+; exception. It is the universal table-of-contents: 8 bits that tell the
+; receiver exactly what kind of transmission is arriving and what to expect next.
+;
+; Bit layout (protocol bit 1 = x86 bit 7 = mask 0x80):
+;
+;   Bit 1 (0x80): BitPad Mode
+;     0 = Wave mode  — lightweight, Layer 1 not required unless category demands it
+;     1 = Record mode — full BitPad, Meta byte 2 always follows, Layer 1 required
+;
+;   Bit 2 (0x40): Dual-role field
+;     Wave (bit1=0): ACK Request — receiver must send ACK response
+;     Record (bit1=1): System Context Extension follows Layer 1
+;
+;   Bit 3 (0x20): Continuation
+;     0 = Complete, self-contained transmission
+;     1 = Fragment — receiver accumulates until Continuation=0
+;
+;   Bit 4 (0x10): Treatment Switch (Wave mode only, ignored in Record mode)
+;     0 = Basic treatment: bits 5-8 are Role A descriptor flags
+;     1 = Category mode:   bits 5-8 are Role B 4-bit category code
+;
+;   Bits 5-8 (0x0F): Content Field — three roles:
+;     Role A (bit1=0, bit4=0): Priority | Cipher | ExtFlags | Profile
+;     Role B (bit1=0, bit4=1): 4-bit category code (0x0-0xF)
+;     Role C (bit1=1):         Value|Time|Task|Note expect flags
+;
+; Exports: meta1_build
+; ═══════════════════════════════════════════════════════════════════════════════
+
+    %include "include/bitpads.inc"
+    %include "include/syscall.inc"
+    %include "include/macros.inc"
+
+    global meta1_build
+
+section .text
+
+; ─────────────────────────────────────────────────────────────────────────────
+; meta1_build
+;   Construct Meta Byte 1 from the bp_ctx structure.
+;
+; Input:  rdi = pointer to bp_ctx structure
+; Output: al  = completed Meta Byte 1 byte value
+;
+; The caller writes al into the output buffer as the first byte of the
+; transmission.
+; ─────────────────────────────────────────────────────────────────────────────
+meta1_build:
+    push    rbp
+    mov     rbp, rsp                ; establish stack frame for debugger visibility
+    push    rbx                     ; rbx = bp_ctx pointer (callee-saved copy)
+
+    mov     rbx, rdi                ; rbx = bp_ctx pointer (free rdi for comparisons)
+    xor     eax, eax                ; al = 0x00 — start with a completely clear byte
+                                    ; we will OR in each field individually below
+
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BIT 1 (0x80): BitPad Mode — Wave or Record
+    ;
+    ; Protocol: BP_TYPE_RECORD=2, BP_TYPE_LEDGER=3 → Record mode (bit1=1)
+    ;           BP_TYPE_SIGNAL=0, BP_TYPE_WAVE=1, BP_TYPE_TELEM=4 → Wave (bit1=0)
+    ; ═══════════════════════════════════════════════════════════════════════
+    movzx   ecx, byte [rbx + BP_CTX_TYPE]   ; ecx = transmission type (0-4)
+    cmp     cl, BP_TYPE_RECORD              ; type < 2 → Wave
+    jl      .wave_mode
+    cmp     cl, BP_TYPE_TELEM              ; type 4 (telem) → Wave (engineering Wave, not Record)
+    je      .wave_mode
+
+    or      al, BPv2_META1_MODE             ; type 2 (record) or 3 (ledger) → Record mode bit
+                                            ; "1 = Record mode. Full BitPad."
+
+.wave_mode:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BIT 2 (0x40): ACK Request (Wave) / System Context Extension (Record)
+    ; ═══════════════════════════════════════════════════════════════════════
+    cmp     byte [rbx + BP_CTX_ACK_REQ], 0  ; is ACK request flag set in ctx?
+    je      .no_ack                          ; 0 = not set, skip
+    or      al, BPv2_META1_ACK_SYSCTX       ; set bit 2 (0x40)
+                                            ; Wave: "1=ACK request, receiver must confirm"
+                                            ; Record: "1=System Context Extension follows L1"
+
+.no_ack:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BIT 3 (0x20): Continuation / Fragment
+    ; ═══════════════════════════════════════════════════════════════════════
+    cmp     byte [rbx + BP_CTX_CONT], 0     ; is continuation flag set?
+    je      .no_cont                         ; 0 = complete transmission
+    or      al, BPv2_META1_CONT             ; set bit 3 (0x20) = fragment, more follows
+                                            ; "Universal across Wave and Record"
+
+.no_cont:
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; BITS 4-8: Content field — Role depends on bit 1 (mode)
+    ; ═══════════════════════════════════════════════════════════════════════
+    test    al, BPv2_META1_MODE             ; test bit 1: is Record mode set?
+    jnz     .record_role_c                  ; yes → build Role C (expect flags)
+                                            ; no  → build Wave roles A or B
+
+    ; ── WAVE MODE: Role A or Role B ──────────────────────────────────────
+    ; Decide between Role A (basic treatment) and Role B (category mode)
+    ; based on whether a non-zero category code is present in ctx.
+    movzx   ecx, byte [rbx + BP_CTX_CATEGORY]  ; ecx = category code from ctx (0-15)
+    test    cl, cl                              ; is category code non-zero?
+    jz      .wave_role_a                        ; zero = basic treatment (Role A)
+
+    ; ── Role B: Category mode (bit4=1, bits5-8 = category code) ──
+    or      al, BPv2_META1_TREAT               ; set bit 4 (0x10) = category mode switch
+                                               ; "1=Category mode, bits 5-8 are Role B category code"
+    and     cl, 0x0F                           ; mask category to 4 bits (safety: protocol uses 4 bits)
+    or      al, cl                             ; place category code in bits 5-8 (lower nibble)
+                                               ; e.g. category 0x0E = 1110 → Telegraph Emulation
+    jmp     .done                              ; Role B complete, skip Role A
+
+.wave_role_a:
+    ; ── Role A: Basic treatment descriptor flags (bit4=0) ──
+    ; Priority flag in bit 5 (mask 0x08 in lower nibble)
+    cmp     byte [rbx + BP_CTX_PRIO], 0        ; is priority flag set?
+    je      .no_prio
+    or      al, BPv2_META1_ROLA_PRIO           ; set bit 5 (0x08) = elevated priority
+                                               ; "1=Elevated. Receiver processes before lower-priority."
+.no_prio:
+    jmp     .done                              ; Role A: only Priority used for now
+
+    ; ── RECORD MODE: Role C (component expect flags) ──────────────────────
+.record_role_c:
+    ; Bits 5-8 in Record mode = Value|Time|Task|Note presence flags
+    ; These tell the receiver exactly which optional components follow in the record.
+
+    cmp     byte [rbx + BP_CTX_VALUE_PRES], 0  ; is Value block present?
+    je      .no_val
+    or      al, BPv2_META1_ROLC_VAL            ; set bit 5 (0x08) = "Value block follows"
+
+.no_val:
+    cmp     byte [rbx + BP_CTX_TIME_PRES], 0   ; is Time field present?
+    je      .no_time
+    or      al, BPv2_META1_ROLC_TIME           ; set bit 6 (0x04) = "Time field follows"
+
+.no_time:
+    cmp     byte [rbx + BP_CTX_TASK_PRES], 0   ; is Task block present?
+    je      .no_task
+    or      al, BPv2_META1_ROLC_TASK           ; set bit 7 (0x02) = "Task short form follows"
+
+.no_task:
+    cmp     byte [rbx + BP_CTX_NOTE_PRES], 0   ; is Note block present?
+    je      .done
+    or      al, BPv2_META1_ROLC_NOTE           ; set bit 8 (0x01) = "Note block follows"
+
+.done:
+    ; al now holds the complete Meta Byte 1 value
+    ; Return: al = finished byte (caller writes it to output buffer position 0)
+
+    pop     rbx
+    pop     rbp
+    ret
