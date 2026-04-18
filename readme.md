@@ -4,6 +4,79 @@
 
 ---
 
+## What is it?
+
+BitPads is a binary protocol family designed from first principles at the mathematical foundation of information exchange. A single Meta byte — the first byte of every transmission — declares the frame type, content flags, and enhancement state before the receiver processes a single payload byte. The protocol scales from a one-byte heartbeat to a 44-byte fully annotated record without changing its structure.
+
+At its core sits **BitLedger**: a binary financial and physical transmission protocol where a complete double-entry transaction encodes in **40 bits — 5 bytes**. The same wire format that carries a monetary transaction carries propellant mass, power obligations, data packets, and mission telemetry. BitPads wraps and extends that core across every transmission context, adding identity, time, task, and annotation layers that attach only when needed.
+
+The project is implemented as a command-line tool written in hand-assembled x86-64 NASM assembly — no C runtime, no dependencies, direct kernel syscalls — producing `.bp` binary frame files that conform to the protocol specification.
+
+---
+
+## The Problem
+
+Every existing protocol that handles financial or resource-flow data carries one of three fundamental burdens: **verbosity**, **schema dependency**, or **single-domain design**.
+
+JSON and XML are off the chart — 80,000 bytes for 100 transactions where BitLedger needs 512. ISO 20022, the current banking standard, is primarily XML; its binary encodings exist but are not widely deployed and remain verbose by design. NACHA ACH files are text-based fixed-width with no per-record integrity check and no real-time capability. ISO 8583, the nearest binary peer for financial messaging, is optimised for card-network authorization flows — not for double-entry ledger semantics, not for conservation-law enforcement, and not for cross-domain use.
+
+None of these protocols recognise the structural identity between financial accounting and physical conservation. A factory tracking material balance, a satellite constellation settling power obligations between nodes, a supply chain enforcing that every unit leaving one station arrives at another — all of these are the same algebra. Existing standards force each domain to reinvent its own wire format. BitLedger encodes the invariant directly: for every batch, the sum of all signed flows equals zero. If it does not, the protocol knows before the application does.
+
+---
+
+## How it Works
+
+Every BitPads transmission begins with a **Meta byte** that declares frame mode, content flags, and whether enhancement is active. The receiver reads this byte first and knows exactly what follows — no preamble, no sync sequence, no schema lookup.
+
+**Four frame types exist on a single spectrum:**
+
+| Size | Frame | Contents |
+|------|-------|----------|
+| 1 byte | Pure Signal | Heartbeat, ACK, status flag |
+| 4 bytes | Anonymous Wave | Session-context value, no identity overhead |
+| 13–29 bytes | Full Record | Identity + value + optional time, task, note |
+| 22–28+ bytes | BitLedger Frame | Complete double-entry record with CRC-15 integrity |
+
+A **Layer 1** session header (8 bytes) carries sender identity, domain, permissions, and a CRC-15 computed over the full session payload. A **Layer 2** batch header (6 bytes) declares currency, scaling, and precision defaults that all records in the session inherit. **Layer 3** is the 5-byte BitLedger record itself — value, account pair, direction, and completeness flags — with conservation enforced at encoding time.
+
+The CLI assembles frames by populating a 256-byte context block from command-line flags, then routing to the appropriate layer and component builders. Each builder writes to a stack-allocated output buffer and returns its byte count. The result is written to a file, stdout, or discarded in dry-run mode. No heap allocation. No post-processing.
+
+---
+
+## Current Status
+
+BitPads is under active development. The protocol specifications are versioned and stable. The macOS CLI (`assemblycli/`) is functional and produces conformant frames for all four frame types across all protocol layers. A Linux port (`linux_assembly_cli/`) has been assembled to ELF64 but has not yet been linked or run on a Linux machine.
+
+**What works:** frame assembly for Pure Signal, Wave, Record, and BitLedger types; Layer 1 with CRC-15 embed; Layer 2 batch headers; Meta Byte 1 and 2 construction; value encoding across four tiers; T1S and T2 time fields; task and note blocks; C0 Enhancement Grammar signal slot presence; telegraph, compact command, and context declaration Wave categories; file, stdout, and dry-run output modes.
+
+**Known gaps:** signal slot content bytes are declared but not yet written; the 28-byte vs 22-byte footprint discrepancy in the spec needs resolution; no formal byte-level test vectors exist; no decoder — the CLI is encode-only; `--help` output is absent.
+
+---
+
+## The Vision
+
+BitPads is built on one observation: **every meaningful exchange of value between entities is a conservation law**. Money conserved. Mass conserved. Energy conserved. Data conserved. The same algebraic invariant governs double-entry accounting, Kirchhoff's current law, mass balance equations, and momentum transfer. The protocol encodes that invariant at the wire level — not as a rule the application must enforce, but as a structural property of the encoding itself.
+
+The goal is a single protocol that works without modification from a deep-space telemetry link to a high-frequency industrial controller to an IoT sensor reporting resource consumption — and that carries financial transactions on the same wire format as physical flows, because they are the same mathematics. The C0 Enhancement Grammar extends this to rich typed signalling, binary pictography using four bits per symbol through a shared codebook, and legacy-compatible telegraph emulation that a 1960s teleprinter can receive correctly.
+
+BitPads did not set out to be universal. It became universal because the conservation invariant is universal.
+
+---
+
+## Industry Context
+
+No public standard is as lean and ledger-native as BitLedger for constrained transmission environments. The closest existing protocols each cover part of the ground:
+
+**ISO 8583** is the nearest binary peer — compact, bitmap-driven, battle-tested in card networks and ATMs. It matches BitPads for raw density on simple payment messages but lacks native double-entry account-pair semantics, compound continuation markers, session-layer CRC, and cross-domain capability.
+
+**NACHA ACH** and **ISO 20022** are the nearest standards for batch double-entry ledger transfers. Both are text-based or XML-based by default, designed for nightly settlement volumes rather than real-time low-bandwidth links, and carry no per-record integrity mechanism equivalent to CRC-15.
+
+**FIX/FAST** achieves high density for market data but is trading-oriented, not general-ledger. **EDI X12 / EDIFACT** handles structured commerce at scale but is text-based and verbose. Proprietary ERP formats (SAP IDoc and equivalents) are ledger-centric and binary but closed.
+
+BitPads + BitLedger fills the gap that none of these address: an **open, binary-first, double-entry-native protocol** with session-layer CRC integrity, a universal domain extension that covers any conserved scalar, and a transmission spectrum that runs from one byte to a fully annotated record — deployable on a satellite link, an industrial bus, or a standard IP socket without format changes.
+
+---
+
 ## What This Is
 
 BitPads is the outermost layer of a binary protocol family built from first principles at the mathematical foundation of information exchange. A single Meta byte declares everything that follows — mode, content type, expect flags, enhancement state — before the receiver reads a single payload byte. A transmission can be a one-byte heartbeat or a fully specified 44-byte record carrying identity, time, value, task, and annotation. The protocol scales from deep space telemetry to high-frequency industrial control without changing its structure.
